@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>picmagick-gui</title>
+<script>
+  // Apply the saved theme before first paint so the page never flashes the
+  // default colours. Inline and dependency-free on purpose.
+  try {
+    var t = localStorage.getItem("picmagik.theme") || "auto";
+    if (t === "auto") t = matchMedia("(prefers-color-scheme: light)").matches ? "daylight" : "midnight";
+    document.documentElement.dataset.theme = t;
+  } catch (e) { /* private mode: stay on the default */ }
+</script>
 <link rel="stylesheet" href="/style.css">
 </head>
 <body>
@@ -17,6 +26,18 @@
   <div class="bar-actions">
     <button id="imUpdate" class="update-pill hidden" title="ImageMagick update"></button>
     <span id="redundancy" class="pill warn hidden"></span>
+    <label class="theme-pick" title="Colour and text theme">
+      <span class="muted">Theme</span>
+      <select id="themePick">
+        <option value="auto">Auto (system)</option>
+        <option value="midnight">Midnight</option>
+        <option value="daylight">Daylight</option>
+        <option value="ink">Ink</option>
+        <option value="sepia">Sepia</option>
+        <option value="nord">Nord</option>
+        <option value="rose">Rose</option>
+      </select>
+    </label>
     <button id="btnHealth" class="ghost">Health</button>
     <button id="btnQuit" class="ghost" title="Stop the picmagick-gui server">Quit</button>
   </div>

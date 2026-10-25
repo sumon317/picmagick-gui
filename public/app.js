@@ -1122,6 +1122,41 @@ function streamProgress(jobId, replay = false) {
   };
 }
 
+// ── theme ───────────────────────────────────
+/** Valid theme ids; anything else stored falls back to "auto". */
+const THEME_IDS = ["midnight", "daylight", "ink", "sepia", "nord", "rose"];
+
+function storedTheme() {
+  try { return localStorage.getItem("picmagik.theme"); } catch { return null; }
+}
+
+const savedTheme = storedTheme();
+let themeChoice = THEME_IDS.includes(savedTheme) ? savedTheme : "auto";
+
+/** Auto resolves against the OS preference, same as the inline head script. */
+function resolvedTheme() {
+  if (themeChoice !== "auto") return themeChoice;
+  return window.matchMedia("(prefers-color-scheme: light)").matches ? "daylight" : "midnight";
+}
+
+function setTheme(choice) {
+  themeChoice = THEME_IDS.includes(choice) ? choice : "auto";
+  try { localStorage.setItem("picmagik.theme", themeChoice); } catch { /* private mode */ }
+  document.documentElement.dataset.theme = resolvedTheme();
+  $("themePick").value = themeChoice;
+}
+
+// While on Auto, follow a live OS switch without waiting for a reload.
+window.matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+  if (themeChoice === "auto") document.documentElement.dataset.theme = resolvedTheme();
+});
+
+// The inline head script already applied the theme before first paint; this
+// re-applies it in case that could not run, and syncs the picker.
+document.documentElement.dataset.theme = resolvedTheme();
+$("themePick").value = themeChoice;
+$("themePick").onchange = () => setTheme($("themePick").value);
+
 // ── misc ───────────────────────────────────
 /** @param {unknown} s */
 function esc(s) {
