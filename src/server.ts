@@ -788,8 +788,12 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
 
     const srcArg = sourceArgFor(file.abs, file.ext, format, false);
     const speed = state.policy.heicSpeed;
+    // Browsers natively render avif, webp, jpeg, and png in <img> tags;
+    // jxl, heic, and jp2 need a decoded PNG proxy to display in WebView2/Chromium.
+    const browserCanRenderVariant = NATIVE_IMAGE_EXTS.has(spec.ext.toLowerCase());
     const variants: { quality: number; label: string; url: string; bytes: number }[] = [];
     const errors: string[] = [];
+
     for (const q of qualities) {
       // Include format and speed in the name so changing either slider cannot
       // serve a stale preview from the disposable cache.
@@ -811,10 +815,29 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
         size = (await stat(out)).size;
         if (size === 0) { errors.push(`q${q}: encoder wrote nothing`); continue; }
       } catch { errors.push(`q${q}: no output produced`); continue; }
+
+      let displayName = name;
+      if (!browserCanRenderVariant) {
+        const proxyName = `${name}.png`;
+        const proxyOut = path.join(outDir, proxyName);
+        await new Promise<void>((resolve) => {
+          const c = spawn(
+            magick.path,
+            [`${out}[0]`, "-auto-orient", "-colorspace", "sRGB", `PNG:${proxyOut}`],
+            { windowsHide: true, stdio: "ignore", env: { ...process.env, MAGICK_THREAD_LIMIT: "1" } },
+          );
+          c.on("close", () => resolve());
+          c.on("error", () => resolve());
+        });
+        if (existsSync(proxyOut)) {
+          displayName = proxyName;
+        }
+      }
+
       variants.push({
         quality: q,
         label: qualityDisplay(format, q),
-        url: `/preview-cache/${name}`,
+        url: `/preview-cache/${displayName}`,
         bytes: size,
       });
     }
@@ -839,28 +862,90 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const file = findFileByRel(rel);
     if (!file) throw new HttpError(404, "Not in scan.");
 
-    // This route exists so the browser can show the untouched original next to
-    // the AVIF variants. It must never serve video, archives or cache files -
-    // A single file can be several gigabytes, and reading one into memory
-    // memory would take the server down.
-    if (!IMAGE_MIME[file.ext.toLowerCase()]) {
-      throw new HttpError(415, `Not a displayable image: .${file.ext}`);
-    }
-    if (file.size > MAX_PASSTHROUGH_BYTES) {
-      throw new HttpError(
-        413,
-        `Too large to preview in the browser: ${(file.size / 1024 ** 3).toFixed(2)} GB`,
-      );
+    const ext = file.ext.toLowerCase();
+
+    // 1. Browser-native formats (JPG, PNG, WebP, AVIF, GIF, BMP): serve directly
+    if (NATIVE_IMAGE_EXTS.has(ext)) {
+      if (file.size > MAX_PASSTHROUGH_BYTES) {
+        throw new HttpError(
+          413,
+          `Too large to preview in the browser: ${(file.size / 1024 ** 3).toFixed(2)} GB`,
+        );
+      }
+      const data = await readFile(file.abs);
+      return new Response(data, {
+        headers: {
+          "content-type": IMAGE_MIME[ext] ?? "image/jpeg",
+          "content-length": String(file.size),
+          "cache-control": "no-store",
+        },
+      });
     }
 
-    const data = await readFile(file.abs);
-    return new Response(data, {
-      headers: {
-        "content-type": IMAGE_MIME[file.ext.toLowerCase()],
-        "content-length": String(file.size),
-        "cache-control": "no-store",
-      },
-    });
+    // 2. Non-native photo formats (HEIC, HEIF, TIFF, DNG, CR2, ARW, NEF, etc.):
+    //    Decode via ImageMagick into a full-resolution JPEG in previewCacheDir
+    if (file.category === "image" || file.category === "raw") {
+      await ensureDir(previewCacheDir);
+      const origCacheName = cacheKeyFor(file, "cmp-orig");
+      const origCachePath = path.join(previewCacheDir, origCacheName);
+
+      if (!existsSync(origCachePath)) {
+        const magick = requireMagick();
+        const release = await previewSemaphore.acquire(req.signal);
+        try {
+          if (!existsSync(origCachePath)) {
+            await new Promise<void>((resolve, reject) => {
+              const child = spawn(
+                magick.path,
+                [
+                  `${file.abs}[0]`,
+                  "-auto-orient",
+                  "-colorspace",
+                  "sRGB",
+                  "-quality",
+                  "96",
+                  `JPEG:${origCachePath}`,
+                ],
+                { windowsHide: true, stdio: "ignore" },
+              );
+              const onAbort = () => {
+                try { child.kill(); } catch {}
+                reject(new HttpError(499, "Cancelled"));
+              };
+              req.signal.addEventListener("abort", onAbort, { once: true });
+              const timer = setTimeout(() => {
+                try { child.kill(); } catch {}
+                reject(new Error("Original preview decode timed out"));
+              }, 20_000);
+              child.on("close", (code) => {
+                clearTimeout(timer);
+                req.signal.removeEventListener("abort", onAbort);
+                if (code === 0) resolve();
+                else reject(new Error(`ImageMagick decode exited with ${code}`));
+              });
+              child.on("error", (err) => {
+                clearTimeout(timer);
+                req.signal.removeEventListener("abort", onAbort);
+                reject(err);
+              });
+            });
+          }
+        } finally {
+          release();
+        }
+      }
+
+      const data = await readFile(origCachePath);
+      return new Response(data, {
+        headers: {
+          "content-type": "image/jpeg",
+          "content-length": String(data.byteLength),
+          "cache-control": "no-store",
+        },
+      });
+    }
+
+    throw new HttpError(415, `Not a displayable image: .${file.ext}`);
   }
 
   // ---- thumbnail generator & cache ----
