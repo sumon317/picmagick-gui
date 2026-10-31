@@ -353,6 +353,10 @@ export type EncoderArgsOptions = {
   format: OutputFormat;
   quality: number;
   speed: number;
+  /** Long-edge pixel cap; 0/undefined keeps the original resolution. */
+  maxResolution?: number;
+  /** Strip EXIF/GPS metadata while keeping the pixels. */
+  stripMetadata?: boolean;
 };
 
 /**
@@ -360,10 +364,18 @@ export type EncoderArgsOptions = {
  *
  * The AVIF branch is a literal copy of the pre-format-selection command. Do
  * not add, remove, or reorder flags there: that command is the regression
- * contract for the whole feature.
+ * contract for the whole feature. Resize/strip are appended only when the
+ * user opts in, so the default argument list is unchanged.
  */
 export function buildEncoderArgs(o: EncoderArgsOptions): string[] {
   const base = [o.srcArg, "-auto-orient", "-colorspace", "sRGB"];
+
+  if (o.maxResolution && o.maxResolution > 0) {
+    base.push("-resize", `${o.maxResolution}x${o.maxResolution}>`);
+  }
+  if (o.stripMetadata) {
+    base.push("-strip");
+  }
 
   switch (o.format) {
     case "avif":

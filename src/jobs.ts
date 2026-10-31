@@ -296,7 +296,7 @@ private total = 0;
       }, this.shouldStop);
 
       // A pause is not a finished run, so no manifest is written yet.
-      if (this.pauseRequested) {
+      if (this.pauseRequested && !this.controller.signal.aborted) {
         this.elapsedBeforePauseMs += Date.now() - this.started;
         this.state = "paused";
         this.results = [...this.results, ...result.results];
@@ -342,7 +342,7 @@ private total = 0;
         at: Date.now(),
         jobId: this.id,
         manifestId,
-        summary: this.summary(result.bytes, cancelled ? "cancelled" : undefined),
+        summary: this.summary(this.totals.bytes, cancelled ? "cancelled" : undefined),
       } satisfies Progress);
     } catch (err) {
       this.state = "failed";

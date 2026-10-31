@@ -20,7 +20,8 @@ export function getTotalCpus(): number {
  *   50% -> 4 cores -> mask 0x0Fn (0b00001111)
  *  100% -> 8 cores -> mask 0xFFn (0b11111111)
  */
-export function calculateAffinityMask(percent: number, totalCpus = getTotalCpus()): bigint {
+export function calculateAffinityMask(percent: number, rawTotalCpus = getTotalCpus()): bigint {
+  const totalCpus = Math.max(1, Math.min(64, rawTotalCpus));
   const pct = Math.max(10, Math.min(100, Math.round(percent) || 70));
   if (pct >= 100) {
     return (1n << BigInt(totalCpus)) - 1n;
@@ -87,18 +88,35 @@ const PROCESS_AFFINITY_ACCESS = 0x1F0FFF;
 const PROCESS_SUSPEND_RESUME = 0x0800;
 
 /**
+ * Signals a Linux process group, falling back to the single PID.
+ *
+ * AppImage builds run through a wrapper that forks the real `magick`; only
+ * signalling `-pid` reaches both. Children we did not spawn detached are not
+ * group leaders, so the single-PID fallback keeps them working.
+ */
+function signalLinux(pid: number, signal: NodeJS.Signals): boolean {
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    /* not a process-group leader */
+  }
+  try {
+    process.kill(pid, signal);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Freezes a running process in memory in <1ms without killing it.
  * Uses NtSuspendProcess on Windows and SIGSTOP on Linux.
  */
 export function suspendProcess(pid: number | undefined): boolean {
   if (!pid || pid <= 0) return false;
   if (process.platform === "linux") {
-    try {
-      process.kill(pid, "SIGSTOP");
-      return true;
-    } catch {
-      return false;
-    }
+    return signalLinux(pid, "SIGSTOP");
   }
   if (k32 && ntdll) {
     try {
@@ -122,12 +140,7 @@ export function suspendProcess(pid: number | undefined): boolean {
 export function resumeProcess(pid: number | undefined): boolean {
   if (!pid || pid <= 0) return false;
   if (process.platform === "linux") {
-    try {
-      process.kill(pid, "SIGCONT");
-      return true;
-    } catch {
-      return false;
-    }
+    return signalLinux(pid, "SIGCONT");
   }
   if (k32 && ntdll) {
     try {

@@ -107,6 +107,7 @@ let lightbox: LightboxController;
 let previewTimer: ReturnType<typeof setTimeout> | null = null;
 let extEnabled: Record<string, boolean> = {};
 let scanning = false;
+let queuedNextMode: "image" | "video" | null = null;
 let themeChoice: ThemeChoice = "auto";
 let previewSeq = 0;
 let imStatus: UpdateStatus | null = null;
@@ -171,28 +172,32 @@ const policy = (): Policy => ({
   qualities: [input("quality").valueAsNumber],
   flattenGif: input("flattenGif").checked,
   heicSpeed: input("heicSpeed").valueAsNumber,
+  maxResolution: Number(input("photoMaxRes").value) || 0,
+  skipAlreadyEfficient: input("photoSkipLarger").checked,
+  stripMetadata: input("photoStripMeta").checked,
 });
 
 const budgetBytes = (): number =>
   Math.max(1, Math.round(input("budget").valueAsNumber)) * 1024 ** 3;
 
+const activePolicy = (): Policy | VideoPolicy =>
+  state.mediaMode === "video" ? videoPolicy() : policy();
+
 const save = async (): Promise<void> => {
   const currentDest = input("destination").value.trim();
   if (state.mediaMode === "video") {
-    if (currentDest) {
+    if (state.videoDestMode === "custom" && currentDest) {
       state.videoCustomDestination = currentDest;
     }
-    const chosen = state.videoCustomDestination || currentDest;
     await api<any>("video/config", {
       method: "POST",
       body: {
-        customDestination: chosen,
-        destination: chosen,
+        customDestination:
+          state.videoDestMode === "custom" ? state.videoCustomDestination : undefined,
         budgetBytes: budgetBytes(),
         policy: videoPolicy(),
       },
     });
-    if (state.status && chosen) state.status.destination = chosen;
     return;
   }
   const destination = currentDest;
@@ -223,13 +228,16 @@ const refreshPreview = async (): Promise<void> => {
   state.previewBusy = true;
   try {
     await save();
-    const destVal = input("destination").value.trim() || state.videoCustomDestination;
+    const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
+    const destVal = isCustomVideo
+      ? (input("destination").value.trim() || state.videoCustomDestination)
+      : undefined;
     const preview = await api<PreviewResponse>("preview", {
       method: "POST",
       body: {
-        policy: policy(),
-        customDestination: state.mediaMode === "video" ? destVal : undefined,
-        destination: state.mediaMode === "video" ? destVal : undefined,
+        policy: activePolicy(),
+        customDestination: destVal,
+        destination: destVal,
       },
     });
     if (seq !== previewSeq) return;
@@ -659,8 +667,7 @@ const syncVideoDestUi = (): void => {
 };
 
 const switchMediaMode = async (next: "image" | "video"): Promise<void> => {
-  if (state.running || state.starting || state.mediaMode === next) return;
-  state.mediaMode = next;
+  if (state.running || state.starting || state.mediaMode === next) return;  state.mediaMode = next;
   const isVideo = next === "video";
 
   $("app").setAttribute("data-media-mode", next);
@@ -707,6 +714,15 @@ const switchMediaMode = async (next: "image" | "video"): Promise<void> => {
   renderExtToggles();
   library.refresh();
   await refreshPreview();
+};
+
+/**
+ * Queue the opposite media mode to start automatically when the current run
+ * finishes, so a mixed photo/video library can be converted unattended.
+ */
+const startBothModes = async (): Promise<void> => {
+  queuedNextMode = state.mediaMode === "image" ? "video" : "image";
+  await runLifecycle.start();
 };
 
 const applyVideoPreset = async (preset: "archival" | "balanced" | "spacesaver"): Promise<void> => {
@@ -846,15 +862,20 @@ const runEstimate = async (): Promise<void> => {
   }
   const box = $("estimateBox");
   box.classList.remove("hidden");
+  const isVideo = state.mediaMode === "video";
   box.innerHTML = `<h4>Estimate <small>sampling real files</small></h4>
-    <p class="empty-note">Encoding up to 120 images at the current recipe…</p>`;
+    <p class="empty-note">${
+      isVideo
+        ? "Encoding 3-second midpoint slices from up to 5 videos at the current recipe…"
+        : "Encoding up to 120 images at the current recipe…"
+    }</p>`;
   try {
     const estimate = await api<Estimate>("estimate", {
       method: "POST",
       body: {
-        sampleSize: 120,
+        sampleSize: isVideo ? 5 : 120,
         jobs: clamp(input("jobs").valueAsNumber, 1, 16),
-        policy: policy(),
+        policy: activePolicy(),
       },
     });
     state.lastEstimate = estimate;
@@ -911,7 +932,11 @@ const undoManifest = async (id: string, summary?: ManifestSummary): Promise<void
 const verifyJob = async (jobId: string): Promise<VerifyResponse> =>
   api<VerifyResponse>("verify", { method: "POST", body: { jobId } });
 
-const runCompare = async (rel: string, format?: OutputFormat): Promise<CompareResponse> => {
+const runCompare = async (
+  rel: string,
+  format?: OutputFormat,
+  timestampSec?: number,
+): Promise<CompareResponse> => {
   const chosenFormat = format ?? state.currentFormat;
   const spec = state.formatSpecs[chosenFormat];
   return api<CompareResponse>("compare", {
@@ -920,6 +945,7 @@ const runCompare = async (rel: string, format?: OutputFormat): Promise<CompareRe
       rel,
       format: chosenFormat,
       qualities: spec?.compareQualities ?? [30, 50, 60, 70, 80],
+      timestampSec,
     },
   });
 };
@@ -995,7 +1021,7 @@ const actions: ViewActions = {
     library.refresh();
     updateChrome();
   },
-  policy,
+  policy: activePolicy,
   toast,
   confirm: ask,
   startRun: (opts) => runLifecycle.start(opts),
@@ -1003,7 +1029,7 @@ const actions: ViewActions = {
   verifyJob,
   runCompare,
   selectedFiles: () => library.selected(),
-  setQuality: (quality) => formatUi.setQuality(quality),
+  setQuality: (quality, format) => formatUi.setQuality(quality, format),
   checkMagick: (force) => checkMagick(force),
   refreshStatusMagick: async () => {
     await refreshStatus();
@@ -1593,6 +1619,9 @@ const boot = async (): Promise<void> => {
     input("includeRaw").checked = status.policy.includeRaw;
     input("flattenGif").checked = status.policy.flattenGif;
     input("heicSpeed").value = String(status.policy.heicSpeed);
+    input("photoMaxRes").value = String(status.policy.maxResolution ?? 0);
+    input("photoSkipLarger").checked = status.policy.skipAlreadyEfficient !== false;
+    input("photoStripMeta").checked = Boolean(status.policy.stripMetadata);
 
     formatUi.init(status);
     renderExtToggles();
@@ -1664,6 +1693,7 @@ lightbox = createLightbox(() => library.allFiles());
 
 plan = createPlan({
   onStart: () => void runLifecycle.start(),
+  onStartBoth: () => void startBothModes(),
   onEstimate: () => void runEstimate(),
   onSync: () => auditView.open("sync"),
   onCompare: () => compareView.open(),
@@ -1682,7 +1712,7 @@ formatUi = createFormatUi({
 });
 
 runLifecycle = createRunLifecycle({
-  policy,
+  policy: activePolicy,
   save,
   render: () => {
     runView.renderDock();
@@ -1696,6 +1726,15 @@ runLifecycle = createRunLifecycle({
     if (state.view === "run") runView.renderView();
     await refreshPreview();
     await refreshStatus();
+    if (queuedNextMode && state.run.state === "done") {
+      const next = queuedNextMode;
+      queuedNextMode = null;
+      toast(`Starting queued ${next === "video" ? "video" : "photo"} conversion…`, "info");
+      await switchMediaMode(next);
+      await runLifecycle.start();
+    } else {
+      queuedNextMode = null;
+    }
   },
   onError: (message) => toast(message, "danger"),
   onInfo: (message) => toast(message, "success"),
@@ -1757,6 +1796,9 @@ $("copyUnder").addEventListener("click", () => setUndersize(true));
 $("skipUnder").addEventListener("click", () => setUndersize(false));
 input("includeRaw").addEventListener("change", () => schedulePreview());
 input("flattenGif").addEventListener("change", () => schedulePreview());
+input("photoMaxRes").addEventListener("change", () => schedulePreview());
+input("photoSkipLarger").addEventListener("change", () => schedulePreview());
+input("photoStripMeta").addEventListener("change", () => schedulePreview());
 
 input("budget").addEventListener("input", () => {
   $("budgetOut").textContent = `${input("budget").value} GB`;

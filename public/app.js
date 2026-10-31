@@ -85,6 +85,7 @@ var VIDEO_ROUTED_PATHS = new Set([
   "preview",
   "estimate",
   "sync",
+  "sync/clean-orphans",
   "duplicates",
   "dates",
   "compare",
@@ -117,6 +118,7 @@ async function api(path, opts = {}) {
     method,
     headers: method === "POST" ? { "content-type": "application/json" } : undefined,
     body: method === "POST" ? JSON.stringify(opts.body ?? {}) : undefined,
+    signal: opts.signal,
     cache: "no-store"
   });
   let data = {};
@@ -432,11 +434,19 @@ function createFormatUi(options) {
     }
     apply(chosen, true);
   };
-  const setQuality = (quality) => {
-    const spec = state.formatSpecs[state.currentFormat];
+  const setQuality = (quality, format) => {
+    const target = format ?? state.currentFormat;
+    const spec = state.formatSpecs[target];
     if (!spec)
       return;
     const next = Math.min(spec.quality.max, Math.max(spec.quality.min, quality));
+    if (target !== state.currentFormat) {
+      state.formatMemory[target] = {
+        quality: next,
+        speed: state.formatMemory[target]?.speed ?? spec.speed.default
+      };
+      return;
+    }
     const inputNode = input("quality");
     inputNode.value = String(next);
     paint(inputNode);
@@ -532,16 +542,13 @@ function isFullyExcluded(rel, ex, inc = new Set, opts = {}) {
     return false;
   const { sep, caseInsensitive } = pathOptions(opts);
   const parts = rel.split(sep);
-  const prefixes = [];
-  for (let i = 1;i <= parts.length; i++) {
-    prefixes.push(fold(parts.slice(0, i).join(sep), caseInsensitive));
-  }
-  for (const p of prefixes)
-    if (inc.has(p))
+  for (let i = parts.length;i >= 1; i--) {
+    const prefix = fold(parts.slice(0, i).join(sep), caseInsensitive);
+    if (inc.has(prefix))
       return false;
-  for (const p of prefixes)
-    if (ex.has(p))
+    if (ex.has(prefix))
       return true;
+  }
   return false;
 }
 function hasExcludedDescendant(node, ex, inc = new Set, opts = {}) {
@@ -805,6 +812,46 @@ function createLibrary(opts) {
     }
     return row;
   };
+  const FILE_CHUNK_SIZE = 150;
+  const scrollRoot = box.closest(".library-scroll");
+  const chunkObserver = "IntersectionObserver" in window ? new IntersectionObserver((entries) => {
+    for (const entry of entries) {
+      if (!entry.isIntersecting)
+        continue;
+      const sentinel = entry.target;
+      sentinel._loadMore?.();
+    }
+  }, { root: scrollRoot, rootMargin: "240px 0px" }) : null;
+  const appendFilesChunked = (container, files, depth, ctx) => {
+    let offset = 0;
+    const renderNextBatch = () => {
+      const slice = files.slice(offset, offset + FILE_CHUNK_SIZE);
+      offset += slice.length;
+      const frag = document.createDocumentFragment();
+      for (const file of slice) {
+        frag.append(fileRow(file, depth, ctx));
+      }
+      container.append(frag);
+      if (offset < files.length) {
+        const remaining = files.length - offset;
+        const sentinel = document.createElement("button");
+        sentinel.type = "button";
+        sentinel.className = "tree-row muted";
+        sentinel.style.paddingLeft = `${8 + depth * 14}px`;
+        sentinel.textContent = `Show ${Math.min(FILE_CHUNK_SIZE, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)…`;
+        const trigger = () => {
+          chunkObserver?.unobserve(sentinel);
+          sentinel.remove();
+          renderNextBatch();
+        };
+        sentinel._loadMore = trigger;
+        sentinel.addEventListener("click", trigger, { once: true });
+        container.append(sentinel);
+        chunkObserver?.observe(sentinel);
+      }
+    };
+    renderNextBatch();
+  };
   const context = () => {
     const o = pathOptions();
     const ci = o.caseInsensitive;
@@ -904,8 +951,12 @@ function createLibrary(opts) {
       if (built)
         return;
       built = true;
-      for (const file of visibleFiles(node.files, ctx.q, selfMatch)) {
-        kids.append(fileRow(file, node.depth + 1, ctx));
+      const filesToRender = visibleFiles(node.files, ctx.q, selfMatch);
+      if (filesToRender.length) {
+        const fileHost = document.createElement("div");
+        fileHost.style.display = "contents";
+        kids.append(fileHost);
+        appendFilesChunked(fileHost, filesToRender, node.depth + 1, ctx);
       }
       for (const child of [...node.children].sort(byName)) {
         const el = nodeElement(child, ctx, selfMatch);
@@ -941,6 +992,7 @@ function createLibrary(opts) {
   const render = () => {
     const focusedRel = document.activeElement?.closest("[data-rel]")?.dataset.rel ?? null;
     const scrollTop = box.scrollTop;
+    chunkObserver?.disconnect();
     box.innerHTML = "";
     if (!state.tree) {
       box.innerHTML = `<div class="empty-state">
@@ -961,8 +1013,7 @@ function createLibrary(opts) {
       label.className = "tree-group-label";
       label.textContent = "Files in source root";
       box.append(label);
-      for (const file of rootFiles)
-        box.append(fileRow(file, 0, ctx));
+      appendFilesChunked(box, rootFiles, 0, ctx);
     }
     for (const child of [...state.tree.children].sort(byName)) {
       const el = nodeElement(child, ctx, false);
@@ -1301,8 +1352,8 @@ var warningsFor = (p) => {
   if (scan?.deadFolders.length) {
     out.push({
       severity: "info",
-      title: `${scan.deadFolders.length} unreadable folder${scan.deadFolders.length === 1 ? "" : "s"} skipped`,
-      body: "The scan could not enter these folders. The rest of the library is unaffected."
+      title: `${scan.deadFolders.length} empty/non-media folder${scan.deadFolders.length === 1 ? "" : "s"} ignored`,
+      body: "These folders contain nothing convertible. They are left out of the plan."
     });
   }
   if (scan && scan.skipped.length) {
@@ -1388,6 +1439,13 @@ function createPlan(opts) {
     } else {
       budgetNote = `Fits the ${fmt(budget.budgetBytes)} budget · ${(frac * 100).toFixed(2)}% used.`;
     }
+    const otherBytes = p.otherModeBytes ?? 0;
+    const otherCount = p.otherModeCount ?? 0;
+    if (otherCount > 0) {
+      const combined = budget.totalEstBytes + otherBytes;
+      const otherLabel = state.mediaMode === "video" ? "photos" : "videos";
+      budgetNote += ` · Combined with ${otherCount.toLocaleString()} ${otherLabel}: ${fmt(combined)} / ${fmt(budget.budgetBytes)}.`;
+    }
     $("budgetNote").textContent = budgetNote;
     $("budgetNoteShort").textContent = `Headroom for the projected output. Currently ${fmt(budget.budgetBytes)}.`;
     $("planHeadMeta").textContent = `${p.formatLabel} · ${p.estOutputFiles.toLocaleString()} outputs`;
@@ -1407,12 +1465,21 @@ function createPlan(opts) {
     const projection = `${fmt(p.sourceBytes)} → ${fmt(p.estOutputBytes)}`;
     const time = estimate ? ` · ~${fmtDuration(estimate.projectedSeconds)}` : "";
     $("startHint").textContent = state.running ? "Progress is in the floating run dock." : total === 0 ? "Include at least one file in the Library." : `${projection}${time} · undo available after the run`;
+    const btnBoth = document.getElementById("btnStartBoth");
+    if (btnBoth) {
+      const showBoth = !state.running && !state.starting && total > 0 && otherCount > 0 && canRun;
+      btnBoth.classList.toggle("hidden", !showBoth);
+      btnBoth.disabled = !showBoth;
+      btnBoth.textContent = `Convert All (${total.toLocaleString()} ${state.mediaMode === "video" ? "videos" : "photos"} + ${otherCount.toLocaleString()} ${state.mediaMode === "video" ? "photos" : "videos"})`;
+    }
     $("syncMeta").textContent = state.lastSync ? `${state.lastSync.pendingCount.toLocaleString()} pending` : "what's new";
     $("estimateMeta").textContent = estimate ? `${estimate.sampleSize.toLocaleString()} sampled` : "real sample";
     $("compareMeta").textContent = total ? `${Math.min(6, total)} picks` : "visual";
     $("auditMeta").textContent = "3 reports";
   };
   $("btnStart").addEventListener("click", opts.onStart);
+  const btnStartBoth = document.getElementById("btnStartBoth");
+  btnStartBoth?.addEventListener("click", () => opts.onStartBoth?.());
   $("btnEstimate").addEventListener("click", opts.onEstimate);
   $("btnSync").addEventListener("click", opts.onSync);
   $("btnCompare").addEventListener("click", opts.onCompare);
@@ -1673,7 +1740,8 @@ function createRunLifecycle(options) {
       const cpuLimitInput = document.getElementById("cpuLimit");
       const overwrite = document.getElementById("overwrite");
       const onlyNew = document.getElementById("onlyNew");
-      const customDest = document.getElementById("destination")?.value.trim() || state.videoCustomDestination;
+      const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
+      const customDest = isCustomVideo ? document.getElementById("destination")?.value.trim() || state.videoCustomDestination : undefined;
       const response = await api("run", {
         method: "POST",
         body: {
@@ -1682,8 +1750,8 @@ function createRunLifecycle(options) {
           overwrite: Boolean(overwrite?.checked),
           onlyNew: Boolean(runOptions.onlyNew ?? onlyNew?.checked),
           policy: options.policy(),
-          customDestination: state.mediaMode === "video" ? customDest || undefined : undefined,
-          destination: state.mediaMode === "video" ? customDest || undefined : undefined
+          customDestination: customDest,
+          destination: customDest
         }
       });
       resetRun(response.total);
@@ -2031,11 +2099,17 @@ function createAuditView(actions) {
   let tab = "sync";
   let busy = null;
   let lastFocus = null;
+  let auditController = null;
   let syncData = null;
   let dupeData = null;
   let datesData = null;
   const drawer = $("auditDrawer");
   const backdrop = $("auditBackdrop");
+  const nextSignal = () => {
+    auditController?.abort();
+    auditController = new AbortController;
+    return auditController.signal;
+  };
   const setTab = (next, fetchIt = true) => {
     tab = next;
     const tabs = { sync: "tabSync", duplicates: "tabDuplicates", dates: "tabDates" };
@@ -2071,7 +2145,10 @@ function createAuditView(actions) {
         <div class="summary-stat"><span class="micro-label">Pending output</span><b>${fmt(data.estOutputBytes)}</b></div>
       </div>
       <p>${data.pendingSourceBytes ? `${fmt(data.pendingSourceBytes)} of source still needs work.` : "No source bytes are pending."}</p>
-      ${data.orphanCount ? `<p class="warn">${data.orphanCount.toLocaleString()} output file(s) (${fmt(data.orphanBytes)}) have no matching source. Left alone — nothing is deleted automatically.</p>` : ""}
+      ${data.orphanCount ? `<p class="warn">${data.orphanCount.toLocaleString()} output file(s) (${fmt(data.orphanBytes)}) have no matching source.</p>
+      <div class="drawer-actions" style="margin-bottom:8px">
+        <button class="btn danger sm" type="button" data-sync-clean-orphans>Remove ${data.orphanCount.toLocaleString()} orphan file(s) (${fmt(data.orphanBytes)})</button>
+      </div>` : ""}
       ${changed ? `<p class="muted">Changed: ${changed}${data.changed.length > 6 ? "…" : ""}</p>` : ""}
       ${pending ? `<div class="drawer-actions"><button class="btn primary sm" type="button" data-sync-run>Convert pending ${pending.toLocaleString()}</button><button class="btn ghost sm" type="button" data-audit-run="sync">Run again</button></div>` : `<p class="ok">Everything in scope is already converted.</p><div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="sync">Run again</button></div>`}
     </div>`;
@@ -2082,7 +2159,11 @@ function createAuditView(actions) {
     busy = "sync";
     $("syncBox").innerHTML = loading("Comparing input against output…");
     try {
-      const data = await api("sync", { method: "POST", body: { policy: actions.policy() } });
+      const data = await api("sync", {
+        method: "POST",
+        body: { policy: actions.policy() },
+        signal: nextSignal()
+      });
       renderSync(data);
     } catch (error) {
       $("syncBox").innerHTML = `<h4>Sync</h4>${errorBox(error.message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="sync">Try again</button></div>`;
@@ -2103,7 +2184,7 @@ function createAuditView(actions) {
       return;
     }
     const groups = data.groups.slice(0, 10);
-    const listed = groups.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0);
+    const totalRemovable = data.groups.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0);
     $("dupeBox").innerHTML = `<div class="result-box">
       <h4>Duplicates <small>${data.groupCount.toLocaleString()} groups</small></h4>
       <p><b>${data.duplicateFiles.toLocaleString()}</b> files are duplicates, wasting <b>${fmt(data.duplicateBytes)}</b> if all converted.</p>
@@ -2113,7 +2194,7 @@ function createAuditView(actions) {
       </div>`).join("")}
       ${data.groupCount > groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>` : ""}
       <div class="drawer-actions">
-        <button class="btn sm" type="button" data-exclude-dupes="${listed}">Exclude ${listed.toLocaleString()} duplicates</button>
+        <button class="btn sm" type="button" data-exclude-dupes="${totalRemovable}">Exclude ${totalRemovable.toLocaleString()} duplicates</button>
         <button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button>
       </div>
     </div>`;
@@ -2124,7 +2205,11 @@ function createAuditView(actions) {
     busy = "duplicates";
     $("dupeBox").innerHTML = loading("Hashing files…");
     try {
-      const data = await api("duplicates", { method: "POST", body: { maxHash: 6000 } });
+      const data = await api("duplicates", {
+        method: "POST",
+        body: { maxHash: 6000, policy: actions.policy() },
+        signal: nextSignal()
+      });
       renderDuplicates(data);
     } catch (error) {
       $("dupeBox").innerHTML = `<h4>Duplicates</h4>${errorBox(error.message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="duplicates">Try again</button></div>`;
@@ -2155,7 +2240,11 @@ function createAuditView(actions) {
     busy = "dates";
     $("datesBox").innerHTML = loading("Reading EXIF dates…");
     try {
-      const data = await api("dates", { method: "POST", body: {} });
+      const data = await api("dates", {
+        method: "POST",
+        body: { policy: actions.policy() },
+        signal: nextSignal()
+      });
       renderDates(data);
     } catch (error) {
       $("datesBox").innerHTML = `<h4>Dates</h4>${errorBox(error.message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="dates">Try again</button></div>`;
@@ -2173,6 +2262,9 @@ function createAuditView(actions) {
     window.setTimeout(() => $(next === "sync" ? "tabSync" : next === "duplicates" ? "tabDuplicates" : "tabDates").focus(), 30);
   };
   const close = () => {
+    auditController?.abort();
+    auditController = null;
+    busy = null;
     drawer.classList.add("hidden");
     backdrop.classList.add("hidden");
     drawer.setAttribute("aria-hidden", "true");
@@ -2211,9 +2303,40 @@ function createAuditView(actions) {
       actions.startRun({ onlyNew: true });
       return;
     }
+    if (target.closest("[data-sync-clean-orphans]")) {
+      if (!syncData?.orphanCount)
+        return;
+      const count = syncData.orphanCount;
+      const bytes = syncData.orphanBytes;
+      const sampleList = syncData.orphans.slice(0, 5).map((o) => `<li class="mono">${escapeHtml(base(o.out))} (${fmt(o.bytes)})</li>`).join("");
+      (async () => {
+        const ok = await actions.confirm({
+          title: "Remove orphan output files?",
+          body: `<p class="modal-copy">Remove <strong>${count.toLocaleString()} orphan file(s) (${fmt(bytes)})</strong> from the destination folder that have no matching source file?</p>
+                 <ul class="modal-copy" style="margin:8px 0;padding-left:18px">${sampleList}</ul>
+                 <p class="modal-copy">Your source library is never touched.</p>`,
+          confirmLabel: `Remove ${count.toLocaleString()} orphans`,
+          danger: true
+        });
+        if (!ok)
+          return;
+        try {
+          const res = await api("sync/clean-orphans", {
+            method: "POST",
+            body: {}
+          });
+          actions.toast(`Removed ${res.removed.toLocaleString()} orphan files, freed ${fmt(res.bytesFreed)}.`, "success");
+          runSync();
+          actions.refreshPreview();
+        } catch (err) {
+          actions.toast(err.message, "danger");
+        }
+      })();
+      return;
+    }
     const exclude = target.closest("[data-exclude-dupes]");
     if (exclude) {
-      const listed = dupeData?.groups.slice(0, 10) ?? [];
+      const listed = dupeData?.groups ?? [];
       const count = listed.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0);
       if (!count)
         return;
@@ -2260,6 +2383,10 @@ var checkIcon = (status) => {
 var statusWord = (status) => status === "ok" ? "OK" : status === "warn" ? "Warning" : "Failed";
 
 // src/client/views/compare.ts
+var fmtTime = (sec) => {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
 function createCompareView(actions) {
   let split = 50;
   let dimensions = null;
@@ -2267,6 +2394,7 @@ function createCompareView(actions) {
   let compareBg = "checker";
   let activeFormat = state.currentFormat;
   let isDraggingSplitter = false;
+  let stagePointerBound = false;
   const fileList = () => actions.selectedFiles();
   const syncFileSelect = (rel) => {
     const select = $("compareFileSelect");
@@ -2366,8 +2494,8 @@ function createCompareView(actions) {
     const footnote = document.getElementById("compareFootnote");
     if (footnote && variant) {
       const spec = state.formatSpecs[data.format];
-      const formatLabel = spec?.shortLabel ?? data.format.toUpperCase();
-      footnote.textContent = `${formatLabel} preserves transparency and animation. q${variant.quality} is recommended.`;
+      const notes = [spec?.transparencyNote, spec?.animationNote].filter(Boolean).join(" ");
+      footnote.textContent = `${notes ? notes + " " : ""}q${variant.quality} is selected.`;
     }
   };
   const renderStage = () => {
@@ -2470,6 +2598,12 @@ function createCompareView(actions) {
           </select>
         </div>
         <span class="dock-sep"></span>
+        ${data.durationSec && data.durationSec > 1.5 ? `<div class="dock-group" title="Scrub video frame timestamp">
+                 <span class="mono" style="font-size:11px;color:var(--text-secondary)">Frame</span>
+                 <input id="compareTimeSlider" type="range" min="0" max="${Math.max(1, Number((data.durationSec - 1).toFixed(1)))}" step="0.5" value="${Number(data.timestampSec ?? 0).toFixed(1)}" style="width:92px">
+                 <span id="compareTimeOut" class="mono" style="font-size:11px;min-width:34px">${fmtTime(data.timestampSec ?? 0)}</span>
+               </div>
+               <span class="dock-sep"></span>` : ""}
         <button id="btnDockFullscreen" class="dock-btn icon-btn" type="button" title="Toggle fullscreen" aria-label="Toggle fullscreen">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
@@ -2534,31 +2668,30 @@ function createCompareView(actions) {
     }
   };
   const setupSplitterEvents = (stage) => {
-    if (state.compareMode !== "split")
-      return;
-    const handle = stage.querySelector(".compare-split-handle");
-    if (!handle)
-      return;
     const onPointerMove = (e) => {
-      if (!isDraggingSplitter)
+      if (!isDraggingSplitter || state.compareMode !== "split")
         return;
       const rect = stage.getBoundingClientRect();
       const pct = (e.clientX - rect.left) / rect.width * 100;
       updateSplitterPosition(pct);
     };
     const onPointerUp = (e) => {
+      const handle = stage.querySelector(".compare-split-handle");
       if (isDraggingSplitter) {
         isDraggingSplitter = false;
-        handle.classList.remove("is-dragging");
+        handle?.classList.remove("is-dragging");
         try {
-          handle.releasePointerCapture(e.pointerId);
+          handle?.releasePointerCapture(e.pointerId);
         } catch {}
       }
       window.removeEventListener("pointermove", onPointerMove);
       window.removeEventListener("pointerup", onPointerUp);
       window.removeEventListener("pointercancel", onPointerUp);
     };
-    handle.addEventListener("pointerdown", (e) => {
+    const handle = stage.querySelector(".compare-split-handle");
+    handle?.addEventListener("pointerdown", (e) => {
+      if (state.compareMode !== "split")
+        return;
       e.preventDefault();
       e.stopPropagation();
       isDraggingSplitter = true;
@@ -2570,32 +2703,46 @@ function createCompareView(actions) {
       window.addEventListener("pointerup", onPointerUp);
       window.addEventListener("pointercancel", onPointerUp);
     });
-    stage.addEventListener("pointerdown", (e) => {
-      if (e.target.closest(".canvas-dock, .frosted-badge, .compare-split-handle")) {
-        return;
-      }
-      if (state.compareMode === "toggle") {
-        state.compareShowOriginal = !state.compareShowOriginal;
-        renderStage();
-        return;
-      }
-      if (state.compareMode === "split") {
-        const rect = stage.getBoundingClientRect();
-        const pct = (e.clientX - rect.left) / rect.width * 100;
-        updateSplitterPosition(pct);
-        isDraggingSplitter = true;
-        handle.classList.add("is-dragging");
-        window.addEventListener("pointermove", onPointerMove);
-        window.addEventListener("pointerup", onPointerUp);
-        window.addEventListener("pointercancel", onPointerUp);
-      }
-    });
+    if (!stagePointerBound) {
+      stagePointerBound = true;
+      stage.addEventListener("pointerdown", (e) => {
+        if (e.target.closest(".canvas-dock, .frosted-badge, .compare-split-handle")) {
+          return;
+        }
+        if (state.compareMode === "toggle") {
+          state.compareShowOriginal = !state.compareShowOriginal;
+          renderStage();
+          return;
+        }
+        if (state.compareMode === "split") {
+          const rect = stage.getBoundingClientRect();
+          const pct = (e.clientX - rect.left) / rect.width * 100;
+          updateSplitterPosition(pct);
+          isDraggingSplitter = true;
+          stage.querySelector(".compare-split-handle")?.classList.add("is-dragging");
+          window.addEventListener("pointermove", onPointerMove);
+          window.addEventListener("pointerup", onPointerUp);
+          window.addEventListener("pointercancel", onPointerUp);
+        }
+      });
+    }
   };
   const setupDockEvents = () => {
     const btnFit = document.getElementById("btnDockFit");
     btnFit?.addEventListener("click", () => setZoom(0));
     const btn100 = document.getElementById("btnDock100");
     btn100?.addEventListener("click", () => setZoom(1));
+    const timeSlider = document.getElementById("compareTimeSlider");
+    const timeOut = document.getElementById("compareTimeOut");
+    timeSlider?.addEventListener("input", () => {
+      if (timeOut)
+        timeOut.textContent = fmtTime(Number(timeSlider.value));
+    });
+    timeSlider?.addEventListener("change", () => {
+      if (state.compareRel) {
+        run(state.compareRel, activeFormat, Number(timeSlider.value));
+      }
+    });
     const dockGroup = document.getElementById("dockModeGroup");
     dockGroup?.addEventListener("click", (e) => {
       const btn = e.target.closest("[data-dock-mode]");
@@ -2624,7 +2771,7 @@ function createCompareView(actions) {
     $("compareStage").classList.add("hidden");
     $("compareRail").classList.add("hidden");
   };
-  const run = async (rel, format) => {
+  const run = async (rel, format, timestampSec) => {
     if (busy)
       return;
     busy = true;
@@ -2644,7 +2791,7 @@ function createCompareView(actions) {
     $("compareStage").classList.add("hidden");
     $("compareRail").classList.add("hidden");
     try {
-      const data = await actions.runCompare(rel, activeFormat);
+      const data = await actions.runCompare(rel, activeFormat, timestampSec);
       state.compare = data;
       if (!data.variants.length) {
         renderEmpty("No variants produced", data.errors[0] ?? "The encoder returned no output for this file.");
@@ -2760,7 +2907,7 @@ function createCompareView(actions) {
     const variant = state.compare.variants[state.compareVariant];
     if (!variant)
       return;
-    actions.setQuality(variant.quality);
+    actions.setQuality(variant.quality, state.compare.format);
     const fmtName = state.compare.format.toUpperCase();
     actions.toast(`Quality set to q${variant.quality} for ${fmtName}.`, "success");
   });
@@ -2771,7 +2918,7 @@ function createCompareView(actions) {
     const variant = state.compare.variants[state.compareVariant];
     if (!variant)
       return;
-    actions.setQuality(variant.quality);
+    actions.setQuality(variant.quality, state.compare.format);
     const fmtName = state.compare.format.toUpperCase();
     actions.toast(`q${variant.quality} set as default for ${fmtName}.`, "success");
   });
@@ -2827,21 +2974,49 @@ function createCompareView(actions) {
 }
 
 // src/client/views/health.ts
+var VIDEO_FORMAT_ROWS = {
+  av1: { label: "AV1 (CPU)", ext: "mkv / mp4" },
+  av1_hw: { label: "AV1 (GPU)", ext: "mkv / mp4" },
+  hevc: { label: "HEVC (CPU)", ext: "mkv / mp4" },
+  hevc_hw: { label: "HEVC (GPU)", ext: "mkv / mp4" },
+  vp9: { label: "VP9", ext: "webm" }
+};
 function createHealthView(actions) {
   let busy = false;
   let lastHealth = null;
   let lastIm = null;
   const supportRow = (format) => {
+    const isVideo = state.mediaMode === "video";
+    const videoSpec = VIDEO_FORMAT_ROWS[format];
     const spec = state.formatSpecs[format];
-    const support = lastHealth?.magick?.formats?.[format] ?? state.status?.magick?.formats?.[format];
+    const formatMap = isVideo ? lastHealth?.magick?.formats : lastHealth?.magick?.formats ?? state.status?.magick?.formats;
+    const support = formatMap?.[format];
     const writable = support?.writable ?? false;
     return `<tr>
-      <td>${escapeHtml(spec?.label ?? format)}</td>
-      <td class="mono">.${escapeHtml(spec?.ext ?? format)}</td>
+      <td>${escapeHtml(videoSpec?.label ?? spec?.label ?? format)}</td>
+      <td class="mono">${escapeHtml(videoSpec?.ext ?? `.${spec?.ext ?? format}`)}</td>
       <td class="mono">${escapeHtml(support?.mode ?? "—")}</td>
       <td class="${writable ? "support-yes" : "support-no"}">${writable ? "Writable" : "Not writable"}</td>
       <td class="muted">${escapeHtml(support?.detail ?? "No encoder reported.")}</td>
     </tr>`;
+  };
+  const ffmpegCard = () => {
+    const ff = lastHealth?.magick;
+    const hwAv1 = state.videoStatus?.ffmpeg?.hwEncoders?.av1;
+    const hwHevc = state.videoStatus?.ffmpeg?.hwEncoders?.hevc;
+    const lines = [];
+    if (ff) {
+      lines.push(`<div class="fact-row"><span>Installed</span><span>${escapeHtml(shortVersion(ff.version))}</span></div>`);
+      lines.push(`<div class="fact-row"><span>Path</span><span class="mono" title="${escapeHtml(ff.path)}">${escapeHtml(ff.path)}</span></div>`);
+      lines.push(`<div class="fact-row"><span>GPU encoders</span><span>${escapeHtml([hwAv1, hwHevc].filter(Boolean).join(", ") || "CPU only")}</span></div>`);
+    } else {
+      lines.push(`<div class="fact-row"><span>Installed</span><span style="color:var(--status-danger)">Not found</span></div>`);
+    }
+    return `<section class="health-section">
+      <div class="section-head"><h3>FFmpeg</h3><span class="chip ${ff ? "ok" : "warn"}">${ff ? "Ready" : "Missing"}</span></div>
+      <div class="fact-list">${lines.join("")}</div>
+      ${ff ? "" : `<div class="health-actions"><button class="btn primary sm" type="button" data-health-ffmpeg>Install FFmpeg</button></div>`}
+    </section>`;
   };
   const imCard = () => {
     const im = lastIm;
@@ -2909,24 +3084,26 @@ function createHealthView(actions) {
         <span class="health-check-icon">${icon(checkIcon(check.status), 16)}</span>
         <div><h4>${escapeHtml(check.label)} <span class="muted">· ${statusWord(check.status)}</span></h4><p>${escapeHtml(check.detail)}</p></div>
       </div>`).join("")}</div>`;
+    const isVideo = state.mediaMode === "video";
     const matrix = `<section class="health-section">
-      <div class="section-head"><h3>Format support</h3><span class="section-meta">${health.magick ? escapeHtml(shortVersion(health.magick.version)) : "ImageMagick not found"}</span></div>
+      <div class="section-head"><h3>Format support</h3><span class="section-meta">${health.magick ? escapeHtml(shortVersion(health.magick.version)) : isVideo ? "FFmpeg not found" : "ImageMagick not found"}</span></div>
       <table class="data-table support-table">
         <thead><tr><th>Format</th><th>Extension</th><th>Mode</th><th>Status</th><th>Encoder</th></tr></thead>
-        <tbody>${(Object.keys(state.formatSpecs).length ? Object.keys(state.formatSpecs) : ["jxl", "avif", "webp", "heic", "jp2", "jpeg", "png"]).map((id) => supportRow(id)).join("")}</tbody>
+        <tbody>${(isVideo ? Object.keys(VIDEO_FORMAT_ROWS) : Object.keys(state.formatSpecs).length ? Object.keys(state.formatSpecs) : ["jxl", "avif", "webp", "heic", "jp2", "jpeg", "png"]).map((id) => supportRow(id)).join("")}</tbody>
       </table>
     </section>`;
-    $("healthBody").innerHTML = banner + checks + matrix + imCard();
+    $("healthBody").innerHTML = banner + checks + matrix + (isVideo ? ffmpegCard() : imCard());
   };
   const refresh = async () => {
     if (busy)
       return;
     busy = true;
-    $("healthBody").innerHTML = `<p class="empty-note">Reading ImageMagick, source, destination, and disk state…</p>`;
+    const isVideo = state.mediaMode === "video";
+    $("healthBody").innerHTML = `<p class="empty-note">Reading ${isVideo ? "FFmpeg" : "ImageMagick"}, source, destination, and disk state…</p>`;
     try {
       const [health, im] = await Promise.all([
         api("health"),
-        actions.checkMagick(false)
+        isVideo ? Promise.resolve(null) : actions.checkMagick(false)
       ]);
       lastHealth = health;
       lastIm = im;
@@ -2939,9 +3116,15 @@ function createHealthView(actions) {
   };
   $("healthRecheck").addEventListener("click", () => void refresh());
   $("healthBody").addEventListener("click", (event) => {
-    if (!event.target.closest("[data-health-install]"))
-      return;
-    actions.installMagick().then(refresh);
+    const target = event.target;
+    if (target.closest("[data-health-install]")) {
+      actions.installMagick().then(refresh);
+    } else if (target.closest("[data-health-ffmpeg]")) {
+      api("video/ffmpeg/install", { method: "POST", body: {} }).then(() => {
+        actions.toast("FFmpeg installed successfully!", "success");
+        return refresh();
+      }).catch((err) => actions.toast(err.message, "danger"));
+    }
   });
   const open = () => {
     actions.switchView("health");
@@ -3256,6 +3439,7 @@ var lightbox;
 var previewTimer = null;
 var extEnabled = {};
 var scanning = false;
+var queuedNextMode = null;
 var themeChoice = "auto";
 var previewSeq = 0;
 var imStatus = null;
@@ -3309,27 +3493,27 @@ var policy = () => ({
   outputFormat: state.currentFormat,
   qualities: [input("quality").valueAsNumber],
   flattenGif: input("flattenGif").checked,
-  heicSpeed: input("heicSpeed").valueAsNumber
+  heicSpeed: input("heicSpeed").valueAsNumber,
+  maxResolution: Number(input("photoMaxRes").value) || 0,
+  skipAlreadyEfficient: input("photoSkipLarger").checked,
+  stripMetadata: input("photoStripMeta").checked
 });
 var budgetBytes = () => Math.max(1, Math.round(input("budget").valueAsNumber)) * 1024 ** 3;
+var activePolicy = () => state.mediaMode === "video" ? videoPolicy() : policy();
 var save = async () => {
   const currentDest = input("destination").value.trim();
   if (state.mediaMode === "video") {
-    if (currentDest) {
+    if (state.videoDestMode === "custom" && currentDest) {
       state.videoCustomDestination = currentDest;
     }
-    const chosen = state.videoCustomDestination || currentDest;
     await api("video/config", {
       method: "POST",
       body: {
-        customDestination: chosen,
-        destination: chosen,
+        customDestination: state.videoDestMode === "custom" ? state.videoCustomDestination : undefined,
         budgetBytes: budgetBytes(),
         policy: videoPolicy()
       }
     });
-    if (state.status && chosen)
-      state.status.destination = chosen;
     return;
   }
   const destination = currentDest;
@@ -3359,13 +3543,14 @@ var refreshPreview = async () => {
   state.previewBusy = true;
   try {
     await save();
-    const destVal = input("destination").value.trim() || state.videoCustomDestination;
+    const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
+    const destVal = isCustomVideo ? input("destination").value.trim() || state.videoCustomDestination : undefined;
     const preview = await api("preview", {
       method: "POST",
       body: {
-        policy: policy(),
-        customDestination: state.mediaMode === "video" ? destVal : undefined,
-        destination: state.mediaMode === "video" ? destVal : undefined
+        policy: activePolicy(),
+        customDestination: destVal,
+        destination: destVal
       }
     });
     if (seq !== previewSeq)
@@ -3750,6 +3935,10 @@ var switchMediaMode = async (next) => {
   library.refresh();
   await refreshPreview();
 };
+var startBothModes = async () => {
+  queuedNextMode = state.mediaMode === "image" ? "video" : "image";
+  await runLifecycle.start();
+};
 var applyVideoPreset = async (preset) => {
   $("btnPresetArchival").setAttribute("aria-pressed", String(preset === "archival"));
   $("btnPresetBalanced").setAttribute("aria-pressed", String(preset === "balanced"));
@@ -3866,15 +4055,16 @@ var runEstimate = async () => {
   }
   const box = $("estimateBox");
   box.classList.remove("hidden");
+  const isVideo = state.mediaMode === "video";
   box.innerHTML = `<h4>Estimate <small>sampling real files</small></h4>
-    <p class="empty-note">Encoding up to 120 images at the current recipe…</p>`;
+    <p class="empty-note">${isVideo ? "Encoding 3-second midpoint slices from up to 5 videos at the current recipe…" : "Encoding up to 120 images at the current recipe…"}</p>`;
   try {
     const estimate = await api("estimate", {
       method: "POST",
       body: {
-        sampleSize: 120,
+        sampleSize: isVideo ? 5 : 120,
         jobs: clamp(input("jobs").valueAsNumber, 1, 16),
-        policy: policy()
+        policy: activePolicy()
       }
     });
     state.lastEstimate = estimate;
@@ -3923,7 +4113,7 @@ var undoManifest = async (id, summary) => {
   }
 };
 var verifyJob = async (jobId) => api("verify", { method: "POST", body: { jobId } });
-var runCompare = async (rel, format) => {
+var runCompare = async (rel, format, timestampSec) => {
   const chosenFormat = format ?? state.currentFormat;
   const spec = state.formatSpecs[chosenFormat];
   return api("compare", {
@@ -3931,7 +4121,8 @@ var runCompare = async (rel, format) => {
     body: {
       rel,
       format: chosenFormat,
-      qualities: spec?.compareQualities ?? [30, 50, 60, 70, 80]
+      qualities: spec?.compareQualities ?? [30, 50, 60, 70, 80],
+      timestampSec
     }
   });
 };
@@ -3985,7 +4176,7 @@ var actions = {
     library.refresh();
     updateChrome();
   },
-  policy,
+  policy: activePolicy,
   toast,
   confirm: ask,
   startRun: (opts) => runLifecycle.start(opts),
@@ -3993,7 +4184,7 @@ var actions = {
   verifyJob,
   runCompare,
   selectedFiles: () => library.selected(),
-  setQuality: (quality) => formatUi.setQuality(quality),
+  setQuality: (quality, format) => formatUi.setQuality(quality, format),
   checkMagick: (force) => checkMagick(force),
   refreshStatusMagick: async () => {
     await refreshStatus();
@@ -4446,6 +4637,9 @@ var boot = async () => {
     input("includeRaw").checked = status.policy.includeRaw;
     input("flattenGif").checked = status.policy.flattenGif;
     input("heicSpeed").value = String(status.policy.heicSpeed);
+    input("photoMaxRes").value = String(status.policy.maxResolution ?? 0);
+    input("photoSkipLarger").checked = status.policy.skipAlreadyEfficient !== false;
+    input("photoStripMeta").checked = Boolean(status.policy.stripMetadata);
     formatUi.init(status);
     renderExtToggles();
     setUndersize(status.policy.copyUndersized);
@@ -4504,6 +4698,7 @@ library = createLibrary({
 lightbox = createLightbox(() => library.allFiles());
 plan = createPlan({
   onStart: () => void runLifecycle.start(),
+  onStartBoth: () => void startBothModes(),
   onEstimate: () => void runEstimate(),
   onSync: () => auditView.open("sync"),
   onCompare: () => compareView.open(),
@@ -4521,7 +4716,7 @@ formatUi = createFormatUi({
   onToast: (message) => toast(message, "warning")
 });
 runLifecycle = createRunLifecycle({
-  policy,
+  policy: activePolicy,
   save,
   render: () => {
     runView.renderDock();
@@ -4537,6 +4732,15 @@ runLifecycle = createRunLifecycle({
       runView.renderView();
     await refreshPreview();
     await refreshStatus();
+    if (queuedNextMode && state.run.state === "done") {
+      const next = queuedNextMode;
+      queuedNextMode = null;
+      toast(`Starting queued ${next === "video" ? "video" : "photo"} conversion…`, "info");
+      await switchMediaMode(next);
+      await runLifecycle.start();
+    } else {
+      queuedNextMode = null;
+    }
   },
   onError: (message) => toast(message, "danger"),
   onInfo: (message) => toast(message, "success"),
@@ -4595,6 +4799,9 @@ $("copyUnder").addEventListener("click", () => setUndersize(true));
 $("skipUnder").addEventListener("click", () => setUndersize(false));
 input("includeRaw").addEventListener("change", () => schedulePreview());
 input("flattenGif").addEventListener("change", () => schedulePreview());
+input("photoMaxRes").addEventListener("change", () => schedulePreview());
+input("photoSkipLarger").addEventListener("change", () => schedulePreview());
+input("photoStripMeta").addEventListener("change", () => schedulePreview());
 input("budget").addEventListener("input", () => {
   $("budgetOut").textContent = `${input("budget").value} GB`;
   paintRange("budget");

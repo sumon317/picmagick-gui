@@ -21,6 +21,7 @@ export class ApiError extends Error {
 type ApiOptions = {
   method?: "GET" | "POST";
   body?: unknown;
+  signal?: AbortSignal;
 };
 
 const VIDEO_ROUTED_PATHS = new Set([
@@ -28,6 +29,7 @@ const VIDEO_ROUTED_PATHS = new Set([
   "preview",
   "estimate",
   "sync",
+  "sync/clean-orphans",
   "duplicates",
   "dates",
   "compare",
@@ -66,6 +68,7 @@ export async function api<T>(path: string, opts: ApiOptions = {}): Promise<T> {
     method,
     headers: method === "POST" ? { "content-type": "application/json" } : undefined,
     body: method === "POST" ? JSON.stringify(opts.body ?? {}) : undefined,
+    signal: opts.signal,
     cache: "no-store",
   });
 

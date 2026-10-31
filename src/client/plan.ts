@@ -11,6 +11,7 @@ import type { FolderRollup, HealthReport, PreviewResponse } from "./types";
 
 export type PlanOptions = {
   onStart: () => void;
+  onStartBoth?: () => void;
   onEstimate: () => void;
   onSync: () => void;
   onCompare: () => void;
@@ -139,8 +140,8 @@ const warningsFor = (p: PreviewResponse): Warning[] => {
   if (scan?.deadFolders.length) {
     out.push({
       severity: "info",
-      title: `${scan.deadFolders.length} unreadable folder${scan.deadFolders.length === 1 ? "" : "s"} skipped`,
-      body: "The scan could not enter these folders. The rest of the library is unaffected.",
+      title: `${scan.deadFolders.length} empty/non-media folder${scan.deadFolders.length === 1 ? "" : "s"} ignored`,
+      body: "These folders contain nothing convertible. They are left out of the plan.",
     });
   }
   if (scan && scan.skipped.length) {
@@ -236,6 +237,13 @@ export function createPlan(opts: PlanOptions): PlanController {
     } else {
       budgetNote = `Fits the ${fmt(budget.budgetBytes)} budget · ${(frac * 100).toFixed(2)}% used.`;
     }
+    const otherBytes = p.otherModeBytes ?? 0;
+    const otherCount = p.otherModeCount ?? 0;
+    if (otherCount > 0) {
+      const combined = budget.totalEstBytes + otherBytes;
+      const otherLabel = state.mediaMode === "video" ? "photos" : "videos";
+      budgetNote += ` · Combined with ${otherCount.toLocaleString()} ${otherLabel}: ${fmt(combined)} / ${fmt(budget.budgetBytes)}.`;
+    }
     $("budgetNote").textContent = budgetNote;
     $("budgetNoteShort").textContent = `Headroom for the projected output. Currently ${fmt(budget.budgetBytes)}.`;
 
@@ -272,6 +280,14 @@ export function createPlan(opts: PlanOptions): PlanController {
         ? "Include at least one file in the Library."
         : `${projection}${time} · undo available after the run`;
 
+    const btnBoth = document.getElementById("btnStartBoth") as HTMLButtonElement | null;
+    if (btnBoth) {
+      const showBoth = !state.running && !state.starting && total > 0 && otherCount > 0 && canRun;
+      btnBoth.classList.toggle("hidden", !showBoth);
+      btnBoth.disabled = !showBoth;
+      btnBoth.textContent = `Convert All (${total.toLocaleString()} ${state.mediaMode === "video" ? "videos" : "photos"} + ${otherCount.toLocaleString()} ${state.mediaMode === "video" ? "photos" : "videos"})`;
+    }
+
     $("syncMeta").textContent = state.lastSync
       ? `${state.lastSync.pendingCount.toLocaleString()} pending`
       : "what's new";
@@ -283,6 +299,8 @@ export function createPlan(opts: PlanOptions): PlanController {
   };
 
   $("btnStart").addEventListener("click", opts.onStart);
+  const btnStartBoth = document.getElementById("btnStartBoth");
+  btnStartBoth?.addEventListener("click", () => opts.onStartBoth?.());
   $("btnEstimate").addEventListener("click", opts.onEstimate);
   $("btnSync").addEventListener("click", opts.onSync);
   $("btnCompare").addEventListener("click", opts.onCompare);

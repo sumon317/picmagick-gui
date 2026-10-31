@@ -15,10 +15,11 @@ import type {
   ProgressEvent,
   RunResponse,
   FileResult,
+  VideoPolicy,
 } from "./types";
 
 export type RunLifecycleOptions = {
-  policy: () => Policy;
+  policy: () => Policy | VideoPolicy;
   save: () => Promise<void>;
   render: () => void;
   openRunView: () => void;
@@ -288,9 +289,10 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
       const cpuLimitInput = document.getElementById("cpuLimit") as HTMLInputElement | null;
       const overwrite = document.getElementById("overwrite") as HTMLInputElement | null;
       const onlyNew = document.getElementById("onlyNew") as HTMLInputElement | null;
-      const customDest =
-        (document.getElementById("destination") as HTMLInputElement | null)?.value.trim() ||
-        state.videoCustomDestination;
+      const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
+      const customDest = isCustomVideo
+        ? ((document.getElementById("destination") as HTMLInputElement | null)?.value.trim() || state.videoCustomDestination)
+        : undefined;
       const response = await api<RunResponse>("run", {
         method: "POST",
         body: {
@@ -299,8 +301,8 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
           overwrite: Boolean(overwrite?.checked),
           onlyNew: Boolean(runOptions.onlyNew ?? onlyNew?.checked),
           policy: options.policy(),
-          customDestination: state.mediaMode === "video" ? (customDest || undefined) : undefined,
-          destination: state.mediaMode === "video" ? (customDest || undefined) : undefined,
+          customDestination: customDest,
+          destination: customDest,
         },
       });
       resetRun(response.total);

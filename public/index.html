@@ -363,6 +363,30 @@
               <input id="flattenGif" type="checkbox">
               <span>Flatten animated GIFs to the first frame</span>
             </label>
+
+            <details class="tinker-drawer">
+              <summary>Advanced Photo Tuning (Resolution, Size Guard, Privacy)</summary>
+              <div class="tinker-drawer-body">
+                <div class="field">
+                  <div class="field-head"><label for="photoMaxRes">Max resolution</label></div>
+                  <select id="photoMaxRes">
+                    <option value="0">Keep original resolution (Default)</option>
+                    <option value="5120">Cap at 5K / 16 MP (5120 px long edge)</option>
+                    <option value="3840">Cap at 4K / 8 MP (3840 px long edge)</option>
+                    <option value="2560">Cap at 2K / QHD (2560 px long edge)</option>
+                    <option value="1920">Cap at 1080p / Full HD (1920 px long edge)</option>
+                  </select>
+                </div>
+                <label class="check" style="margin-top: 10px;">
+                  <input id="photoSkipLarger" type="checkbox" checked>
+                  <span>Copy original if converted file is larger <span class="check-meta">never inflate</span></span>
+                </label>
+                <label class="check">
+                  <input id="photoStripMeta" type="checkbox">
+                  <span>Strip EXIF &amp; GPS metadata <span class="check-meta">privacy mode</span></span>
+                </label>
+              </div>
+            </details>
           </div>
 
           <div id="videoTinkerOpts" class="hidden">
@@ -598,6 +622,7 @@
 
       <div class="plan-cta">
         <button id="btnStart" class="btn primary lg block" type="button" disabled>Start conversion</button>
+        <button id="btnStartBoth" class="btn secondary sm block hidden" type="button" style="margin-top: 6px;">Convert Photos + Videos</button>
         <p class="cta-projection" id="startHint">Choose a source folder to begin.</p>
         <p class="cta-safety">
           <svg width="12" height="12" aria-hidden="true"><use href="#i-lock"></use></svg>
@@ -613,7 +638,7 @@
     <span id="statusScan" class="status-center">Ready</span>
     <span class="status-right">
       <span id="statusPlatform">Windows</span>
-      <span id="statusVersion">v1.3.0</span>
+      <span id="statusVersion">v1.3.1</span>
       <span id="statusMagick"></span>
     </span>
   </footer>

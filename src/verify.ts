@@ -32,6 +32,12 @@ export type VerifyReport = {
   durationMs: number;
 };
 
+/** True when EXIF orientation rotates the image by 90° or 270°, swapping width and height. */
+function swapsDimensionsOnAutoOrient(orientation: string | undefined): boolean {
+  if (!orientation) return false;
+  return /^(LeftTop|RightTop|RightBottom|LeftBottom|5|6|7|8)$/i.test(orientation.trim());
+}
+
 export async function verifyOutputs(
   results: FileResult[],
   magickPath: string,
@@ -61,17 +67,26 @@ export async function verifyOutputs(
     }
 
     if (out && !out.ok) problems.push(`cannot decode: ${out.error ?? "unknown"}`);
-    if (out?.width && out.height && (out.width === 0 || out.height === 0)) {
+    if (out?.width !== undefined && out?.height !== undefined && (out.width === 0 || out.height === 0)) {
       problems.push("zero dimensions");
     }
-    if (src?.width && out?.width && src.width !== out.width) {
-      problems.push(`width changed ${src.width} -> ${out.width}`);
+
+    const swapped = swapsDimensionsOnAutoOrient(src?.orientation);
+    const expectedWidth = swapped ? src?.height : src?.width;
+    const expectedHeight = swapped ? src?.width : src?.height;
+
+    if (expectedWidth && out?.width && expectedWidth !== out.width) {
+      problems.push(`width changed ${expectedWidth} -> ${out.width}`);
     }
-    if (src?.height && out?.height && src.height !== out.height) {
-      problems.push(`height changed ${src.height} -> ${out.height}`);
+    if (expectedHeight && out?.height && expectedHeight !== out.height) {
+      problems.push(`height changed ${expectedHeight} -> ${out.height}`);
     }
-    const dateKept = Boolean(src?.dateOriginal) && Boolean(out?.dateOriginal);
-    if (src?.dateOriginal && !out?.dateOriginal) {
+
+    const dateKept =
+      r.status === "copied"
+        ? Boolean(out?.dateOriginal)
+        : Boolean(src?.dateOriginal) && Boolean(out?.dateOriginal);
+    if (r.status === "converted" && src?.dateOriginal && !out?.dateOriginal) {
       problems.push("EXIF DateTimeOriginal was lost");
     }
 
@@ -80,9 +95,9 @@ export async function verifyOutputs(
       out: r.out!,
       ok: problems.length === 0,
       problems,
-      srcWidth: src?.width,
+      srcWidth: expectedWidth,
       outWidth: out?.width,
-      srcHeight: src?.height,
+      srcHeight: expectedHeight,
       outHeight: out?.height,
       bytes: r.outBytes,
       dateKept,

@@ -100,12 +100,12 @@ export function isFullyExcluded(
   if (!rel) return false;
   const { sep, caseInsensitive } = pathOptions(opts);
   const parts = rel.split(sep);
-  const prefixes: string[] = [];
-  for (let i = 1; i <= parts.length; i++) {
-    prefixes.push(fold(parts.slice(0, i).join(sep), caseInsensitive));
+  // Walk from deepest path to shallowest so the most specific rule wins
+  for (let i = parts.length; i >= 1; i--) {
+    const prefix = fold(parts.slice(0, i).join(sep), caseInsensitive);
+    if (inc.has(prefix)) return false;
+    if (ex.has(prefix)) return true;
   }
-  for (const p of prefixes) if (inc.has(p)) return false;
-  for (const p of prefixes) if (ex.has(p)) return true;
   return false;
 }
 

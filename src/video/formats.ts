@@ -369,10 +369,11 @@ export function buildVideoEncoderArgs(o: VideoEncoderArgsOptions): string[] {
   const vf: string[] = [];
   const maxRes = o.maxResolution ?? 0;
   if (maxRes > 0) {
-    const longEdge =
-      maxRes === 2160 ? 3840 : maxRes === 1440 ? 2560 : maxRes === 1080 ? 1920 : 1280;
+    // maxResolution is a short-edge height (720p/1080p/1440p/2160p), so cap the
+    // short edge and let the long edge follow the aspect ratio. This keeps
+    // ultrawide footage (e.g. 2560x1080) from being needlessly downscaled.
     vf.push(
-      `scale='if(gt(ih,iw),-2,min(${longEdge},iw))':'if(gt(ih,iw),min(${longEdge},ih),-2)':flags=lanczos`,
+      `scale='if(gt(iw,ih),-2,min(${maxRes},iw))':'if(gt(iw,ih),min(${maxRes},ih),-2)':flags=lanczos`,
     );
   }
 

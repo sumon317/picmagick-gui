@@ -164,11 +164,13 @@ function extractAppArchive(archive: string, destDir: string): void {
       return;
     } catch {
       // Fallback: PowerShell Expand-Archive
+      const safeArchive = archive.replace(/'/g, "''");
+      const safeDest = destDir.replace(/'/g, "''");
       execFileSync("powershell.exe", [
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        `Expand-Archive -LiteralPath '${archive}' -DestinationPath '${destDir}' -Force`,
+        `Expand-Archive -LiteralPath '${safeArchive}' -DestinationPath '${safeDest}' -Force`,
       ], {
         stdio: "ignore",
         windowsHide: true,

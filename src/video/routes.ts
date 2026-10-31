@@ -6,7 +6,8 @@
  * resolution, slice estimation, frame-compare, and video jobs isolated.
  */
 import { spawn } from "node:child_process";
-import { mkdir, stat } from "node:fs/promises";
+import { existsSync } from "node:fs";
+import { mkdir, rm, stat } from "node:fs/promises";
 import path from "node:path";
 
 import { planBudget, type BudgetPlan } from "../budget.ts";
@@ -15,7 +16,7 @@ import { findDuplicates } from "../dedupe.ts";
 import { liveJob, manifestsFor, undoManifest } from "../jobs.ts";
 import type { Manifest } from "../manifest.ts";
 import { assertDestinationSafe, ensureDir, freeSpace } from "../paths.ts";
-import type { Policy } from "../policy.ts";
+import { applyPolicy, type Policy } from "../policy.ts";
 import type { ScannedFile, ScanResult } from "../scan.ts";
 import { estimateVideoFromSample } from "./estimate.ts";
 import {
@@ -57,10 +58,13 @@ import {
   type VideoPreview,
 } from "./policy.ts";
 import { analyseVideoSync, pendingVideoOnly } from "./sync.ts";
+import { cleanOrphans } from "../sync.ts";
+import { loadPersistedSettings, savePersistedSettings } from "../settings.ts";
 
 export type SharedServerBridge = {
   getSourceRoot: () => string;
   getPhotoDestination: () => string;
+  getPhotoPolicy: () => Policy;
   getBudgetBytes: () => number;
   setBudgetBytes: (bytes: number) => void;
   getScan: () => ScanResult | null;
@@ -82,16 +86,23 @@ function defaultVideoRatios(): Record<VideoOutputFormat, number> {
   ) as Record<VideoOutputFormat, number>;
 }
 
+const savedVideoSettings = loadPersistedSettings();
+
 const vState: VideoServerState = {
-  customDestination: "",
+  customDestination: savedVideoSettings.videoCustomDestination ?? "",
   ffmpeg: null,
-  policy: normaliseVideoPolicy(DEFAULT_VIDEO_POLICY),
+  policy: normaliseVideoPolicy(savedVideoSettings.videoPolicy ?? DEFAULT_VIDEO_POLICY),
   ratios: defaultVideoRatios(),
   lastPreview: null,
 };
 
 export function isVideoJobActive(): boolean {
   return Boolean(liveVideoJob()) || getFfmpegInstallProgress().running;
+}
+
+/** Current video projection, using the user's saved video recipe and ratios. */
+export function currentVideoPreview(scan: ScanResult): VideoPreview {
+  return applyVideoPolicy(scan, vState.policy, vState.ratios[vState.policy.outputFormat]);
 }
 
 export function resetVideoScanState(): void {
@@ -225,7 +236,7 @@ export async function handleVideoApi(
       ? rawDest
       : vState.customDestination;
 
-    if (rawDest) {
+    if (rawDest && !body.policy?.destMode) {
       nextPolicy.destMode = "custom";
     }
 
@@ -244,6 +255,12 @@ export async function handleVideoApi(
     if (typeof body.budgetBytes === "number") {
       bridge.setBudgetBytes(body.budgetBytes);
     }
+
+    savePersistedSettings({
+      videoPolicy: vState.policy,
+      videoCustomDestination: vState.customDestination,
+      budgetBytes: bridge.getBudgetBytes(),
+    });
 
     return json({
       ok: true,
@@ -267,7 +284,7 @@ export async function handleVideoApi(
       vState.policy = mergeVideoPolicyUpdate(vState.policy, body.policy);
     }
     const rawDest = (body.customDestination || body.destination)?.trim();
-    if (rawDest) {
+    if (rawDest && !body.policy?.destMode) {
       vState.customDestination = rawDest;
       vState.policy.destMode = "custom";
     }
@@ -275,6 +292,12 @@ export async function handleVideoApi(
     const ratio = vState.ratios[vState.policy.outputFormat];
     const preview = applyVideoPolicy(scan, vState.policy, ratio);
     vState.lastPreview = preview;
+
+    // The same scan also contains photos. Show their projection so the budget
+    // meter represents the combined footprint of a mixed camera roll.
+    const photoPreview = applyPolicy(scan, bridge.getPhotoPolicy());
+    const otherModeBytes = photoPreview.estOutputBytes;
+    const otherModeCount = photoPreview.estOutputFiles;
 
     const budget: BudgetPlan = planBudget(preview as any, bridge.getBudgetBytes());
     const dest = effectiveDest(bridge);
@@ -298,6 +321,8 @@ export async function handleVideoApi(
       effectiveDestination: dest,
       byFolder: preview.byFolder,
       budget,
+      otherModeBytes,
+      otherModeCount,
       health: {
         checks: health.checks,
         magick: null,
@@ -349,7 +374,7 @@ export async function handleVideoApi(
       vState.policy = mergeVideoPolicyUpdate(vState.policy, body.policy);
     }
     const rawDest = (body.customDestination || body.destination)?.trim();
-    if (rawDest) {
+    if (rawDest && !body.policy?.destMode) {
       vState.customDestination = rawDest;
       vState.policy.destMode = "custom";
     }
@@ -377,7 +402,7 @@ export async function handleVideoApi(
       upToDateCount: report.upToDateCount,
       pendingCount: report.pendingCount,
       pendingSourceBytes: report.pendingSourceBytes,
-      orphanCount: report.orphans.length,
+      orphanCount: report.orphanCount,
       orphanBytes: report.orphanBytes,
       orphans: report.orphans.slice(0, 25),
       estOutputBytes: Math.round(
@@ -390,6 +415,18 @@ export async function handleVideoApi(
       changed: report.entries.filter((e) => e.state === "changed").slice(0, 50),
       sampleNew: report.entries.filter((e) => e.state === "new").slice(0, 25),
     });
+  }
+
+  // ---- opt-in orphan cleanup ----
+  if (subroute === "sync/clean-orphans" && req.method === "POST") {
+    const scan = bridge.getScan();
+    if (!scan) throw Object.assign(new Error("Scan the library first."), { status: 400 });
+    const preview = applyVideoPolicy(scan, vState.policy, vState.ratios[vState.policy.outputFormat]);
+    const decisions = [...preview.convert, ...preview.copy];
+    const dest = effectiveDest(bridge);
+    const report = await analyseVideoSync(decisions, bridge.getSourceRoot(), dest, vState.policy);
+    const result = await cleanOrphans(dest, report.orphans);
+    return json(result);
   }
 
   // ---- duplicates ----
@@ -427,6 +464,7 @@ export async function handleVideoApi(
     const asImageCategory = eligibleVideos.map((f) => ({ ...f, category: "image" as const }));
     const res = await findDuplicates(asImageCategory, dummyPolicy, {
       maxHash: Math.min(body.maxHash ?? 2000, 10000),
+      signal: req.signal,
     });
 
     return json({
@@ -459,6 +497,7 @@ export async function handleVideoApi(
       ff.ffprobePath,
       subset.map((d) => d.file),
       8,
+      req.signal,
     );
     const report = buildVideoDateReport(facts);
 
@@ -510,7 +549,10 @@ export async function handleVideoApi(
     const fileHash = hashRel(`${file.rel}:${file.mtime}:ts${sampleTs.toFixed(2)}`);
     const origPngName = `vcmp-orig-${fileHash}.png`;
     const origPngPath = path.join(outDir, origPngName);
-    await extractVideoFramePng(ff.ffmpegPath, file.abs, sampleTs, origPngPath);
+    const okOrig = await extractVideoFramePng(ff.ffmpegPath, file.abs, sampleTs, origPngPath);
+    if (!okOrig || !existsSync(origPngPath)) {
+      throw new Error("Could not extract sample frame from original video.");
+    }
 
     const qualities = (body.qualities ?? spec.compareQualities).slice(0, 5);
     const variants: { quality: number; label: string; url: string; bytes: number }[] = [];
@@ -553,7 +595,7 @@ export async function handleVideoApi(
       });
 
       await new Promise<void>((resolve) => {
-        const c = spawn(ff.ffmpegPath, args, { windowsHide: true });
+        const c = spawn(ff.ffmpegPath, args, { windowsHide: true, stdio: "ignore" });
         c.on("close", () => resolve());
         c.on("error", () => resolve());
       });
@@ -572,6 +614,7 @@ export async function handleVideoApi(
       }
 
       const okFrame = await extractVideoFramePng(ff.ffmpegPath, sliceClipPath, 0, framePngPath);
+      await rm(sliceClipPath, { force: true }).catch(() => {});
       if (!okFrame) {
         errors.push(`q${q}: could not extract preview frame`);
         continue;
@@ -593,6 +636,8 @@ export async function handleVideoApi(
       originalBytes: file.size,
       originalExt: file.ext,
       mtime: file.mtime,
+      durationSec: dur,
+      timestampSec: sampleTs,
       variants,
       errors,
     });
@@ -680,7 +725,7 @@ export async function handleVideoApi(
       vState.policy = mergeVideoPolicyUpdate(vState.policy, body.policy);
     }
     const rawDest = (body.customDestination || body.destination)?.trim();
-    if (rawDest) {
+    if (rawDest && !body.policy?.destMode) {
       vState.customDestination = rawDest;
       vState.policy.destMode = "custom";
     }

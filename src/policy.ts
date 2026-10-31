@@ -49,6 +49,12 @@ export type Policy = {
   qualities: number[];
   flattenGif: boolean;
   heicSpeed: number;
+  /** Long-edge pixel cap (0 = original resolution). */
+  maxResolution?: number;
+  /** Copy original bytes if a single-quality converted file is >= original size. */
+  skipAlreadyEfficient?: boolean;
+  /** Strip EXIF/GPS metadata (-strip). */
+  stripMetadata?: boolean;
 };
 
 export const DEFAULT_POLICY: Policy = {
@@ -68,6 +74,9 @@ export const DEFAULT_POLICY: Policy = {
   //   speed 8 ->  2.5s / 1048 KB     speed 10 -> FAILS, writes a 0-byte file
   // 6 is the knee: ~4x faster than 5 for ~12% more bytes.
   heicSpeed: 6,
+  maxResolution: 0,
+  skipAlreadyEfficient: true,
+  stripMetadata: false,
 };
 
 export type Verdict = "convert" | "copy" | "skip";
@@ -84,6 +93,12 @@ export type Decision = {
   file: ScannedFile;
   verdict: Verdict;
   reason: Reason;
+  /**
+   * Appended to the output stem when a sibling in the same folder would
+   * otherwise land on the identical output path (`IMG_001.JPG` +
+   * `IMG_001.HEIC` -> `IMG_001-jpg.avif` + `IMG_001-heic.avif`).
+   */
+  outStemSuffix?: string;
 };
 
 export type Preview = {
@@ -139,6 +154,11 @@ export function normalisePolicy(p: Partial<Policy> | undefined): Policy {
     minSizeBytes: Math.max(0, base.minSizeBytes ?? 0),
     // aom accepts 0-10, but 10 exits 0 while writing an empty file.
     heicSpeed: Math.max(0, Math.min(9, base.heicSpeed ?? 6)),
+    maxResolution: [0, 5120, 3840, 2560, 1920].includes(Number(base.maxResolution))
+      ? Number(base.maxResolution)
+      : 0,
+    skipAlreadyEfficient: base.skipAlreadyEfficient !== false,
+    stripMetadata: Boolean(base.stripMetadata),
   };
 }
 
@@ -188,14 +208,28 @@ function isExcluded(file: ScannedFile, policy: Policy): boolean {
     if (ex && foldKey(ex) === rel) return true;
   }
 
+  let longestMatchLen = -1;
+  let isEx = false;
+
   for (const inc of policy.includedFolders) {
-    if (inc && under(rel, dir, foldKey(inc))) return false;
+    if (!inc) continue;
+    const f = foldKey(inc);
+    if (under(rel, dir, f) && f.length > longestMatchLen) {
+      longestMatchLen = f.length;
+      isEx = false;
+    }
   }
-  if (!policy.excludedFolders.length) return false;
+
   for (const ex of policy.excludedFolders) {
-    if (ex && under(rel, dir, foldKey(ex))) return true;
+    if (!ex) continue;
+    const f = foldKey(ex);
+    if (under(rel, dir, f) && f.length > longestMatchLen) {
+      longestMatchLen = f.length;
+      isEx = true;
+    }
   }
-  return false;
+
+  return isEx;
 }
 
 export function classify(file: ScannedFile, policy: Policy): { verdict: Verdict; reason: Reason } {
@@ -231,6 +265,46 @@ function classifyBySize(file: ScannedFile, policy: Policy): { verdict: Verdict; 
   return { verdict: "convert", reason: "ok" };
 }
 
+/**
+ * Mark convert decisions whose output path would collide with a sibling.
+ *
+ * Copies always keep their original filename, so they claim that name; a
+ * convert that maps onto the same path gets its source extension appended,
+ * e.g. `IMG_001.HEIC` -> `IMG_001-heic.avif`. The suffix is stored on the
+ * decision so run, estimate, and sync all compute the same path.
+ */
+function annotateCollisions(
+  convert: Decision[],
+  copy: Decision[],
+  targetExt: string,
+): void {
+  const claim = (d: Decision, name: string): { d: Decision; key: string; ext: string } => {
+    const dir = d.file.dir === "." ? "" : d.file.dir;
+    return {
+      d,
+      key: foldKey(path.join(dir, name)),
+      ext: d.file.ext || extOf(d.file.name),
+    };
+  };
+
+  const claims = [
+    ...convert.map((d) => {
+      const stem = path.basename(d.file.name, path.extname(d.file.name));
+      return claim(d, `${stem}.${targetExt}`);
+    }),
+    ...copy.map((d) => claim(d, d.file.name)),
+  ];
+
+  const counts = new Map<string, number>();
+  for (const c of claims) counts.set(c.key, (counts.get(c.key) ?? 0) + 1);
+
+  for (const c of claims) {
+    if (c.d.verdict === "convert" && (counts.get(c.key) ?? 0) > 1) {
+      c.d.outStemSuffix = `-${c.ext}`;
+    }
+  }
+}
+
 export function applyPolicy(
   scan: ScanResult,
   policyInput: Partial<Policy>,
@@ -248,10 +322,11 @@ export function applyPolicy(
     else skip.push({ file, verdict, reason });
   }
 
+  annotateCollisions(convert, copy, FORMAT_SPECS[policy.outputFormat].ext);
+
   const convertBytes = convert.reduce((a, d) => a + d.file.size, 0);
   const copyBytes = copy.reduce((a, d) => a + d.file.size, 0);
   const variants = Math.max(1, policy.qualities.length);
-
   // Copied files land at their original size. Converted files land at ratio,
   // multiplied by the number of quality variants being produced.
   const estOutputBytes = Math.round(convertBytes * ratio * variants + copyBytes);
@@ -311,7 +386,8 @@ export function outputPathFor(
   }
 
   const spec = FORMAT_SPECS[policy.outputFormat];
-  const stem = path.basename(d.file.name, path.extname(d.file.name));
+  const rawStem = path.basename(d.file.name, path.extname(d.file.name));
+  const stem = `${rawStem}${d.outStemSuffix ?? ""}`;
   const multi = policy.qualities.length > 1;
   const name = multi
     ? `${stem}-q${quality ?? policy.qualities[0]}.${spec.ext}`

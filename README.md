@@ -264,24 +264,25 @@ You can change the source and destination in the UI, or set startup defaults
 with environment variables:
 
 ```bat
-set PICMAGIK_SOURCE=D:\Photos
-set PICMAGIK_DESTINATION=D:\Photos-avif
+set COMPAKTA_SOURCE=D:\Photos
+set COMPAKTA_DESTINATION=D:\Photos-avif
 start.bat
 ```
 
 ```powershell
-$env:PICMAGIK_SOURCE = "D:\Photos"
-$env:PICMAGIK_DESTINATION = "D:\Photos-avif"
+$env:COMPAKTA_SOURCE = "D:\Photos"
+$env:COMPAKTA_DESTINATION = "D:\Photos-avif"
 bun start:open
 ```
 
 ```bash
-export PICMAGIK_SOURCE="$HOME/Pictures"
-export PICMAGIK_DESTINATION="$HOME/Pictures-avif"
+export COMPAKTA_SOURCE="$HOME/Pictures"
+export COMPAKTA_DESTINATION="$HOME/Pictures-avif"
 bun start:open
 ```
 
-`PICMAGIK_DESTINATION` defaults to the source path with `-avif` appended.
+`COMPAKTA_DESTINATION` defaults to the source path with `-avif` appended. The
+legacy `PICMAGIK_SOURCE` / `PICMAGIK_DESTINATION` names still work as a fallback.
 Source, destination, budget, and conversion policy are kept in server memory
 for the current session. Restarting the server restores these defaults; use the
 environment variables when you want a persistent starting point.
@@ -798,8 +799,6 @@ detected ImageMagick build cannot write.
 
 ## Out of scope
 
-- Video. This is a still-image tool; video extensions are classified and
-  skipped.
 - Automatic deletion of destination files that have no matching source.
 - Watch-folder auto-conversion.
 - Automatic ImageMagick downloads on Linux ARM64 or macOS.

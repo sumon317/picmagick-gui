@@ -15,6 +15,12 @@ import type { CompareResponse, CompareVariant, OutputFormat } from "../types";
 import type { ViewActions } from "./shared";
 import { emptyState } from "./shared";
 
+/** Format seconds as M:SS for the frame scrubber. */
+const fmtTime = (sec: number): string => {
+  const s = Math.max(0, Math.floor(sec));
+  return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, "0")}`;
+};
+
 export type CompareViewController = {
   open: (rel?: string) => void;
   close: () => void;
@@ -28,6 +34,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
   let compareBg: "checker" | "dark" | "light" = "checker";
   let activeFormat: OutputFormat = state.currentFormat;
   let isDraggingSplitter = false;
+  let stagePointerBound = false;
 
   const fileList = () => actions.selectedFiles();
 
@@ -148,8 +155,8 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     const footnote = document.getElementById("compareFootnote");
     if (footnote && variant) {
       const spec = state.formatSpecs[data.format];
-      const formatLabel = spec?.shortLabel ?? data.format.toUpperCase();
-      footnote.textContent = `${formatLabel} preserves transparency and animation. q${variant.quality} is recommended.`;
+      const notes = [spec?.transparencyNote, spec?.animationNote].filter(Boolean).join(" ");
+      footnote.textContent = `${notes ? notes + " " : ""}q${variant.quality} is selected.`;
     }
   };
 
@@ -276,6 +283,16 @@ export function createCompareView(actions: ViewActions): CompareViewController {
           </select>
         </div>
         <span class="dock-sep"></span>
+        ${
+          data.durationSec && data.durationSec > 1.5
+            ? `<div class="dock-group" title="Scrub video frame timestamp">
+                 <span class="mono" style="font-size:11px;color:var(--text-secondary)">Frame</span>
+                 <input id="compareTimeSlider" type="range" min="0" max="${Math.max(1, Number((data.durationSec - 1).toFixed(1)))}" step="0.5" value="${Number(data.timestampSec ?? 0).toFixed(1)}" style="width:92px">
+                 <span id="compareTimeOut" class="mono" style="font-size:11px;min-width:34px">${fmtTime(data.timestampSec ?? 0)}</span>
+               </div>
+               <span class="dock-sep"></span>`
+            : ""
+        }
         <button id="btnDockFullscreen" class="dock-btn icon-btn" type="button" title="Toggle fullscreen" aria-label="Toggle fullscreen">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <path d="M15 3h6v6M9 21H3v-6M21 3l-7 7M3 21l7-7"/>
@@ -352,24 +369,20 @@ export function createCompareView(actions: ViewActions): CompareViewController {
   };
 
   const setupSplitterEvents = (stage: HTMLElement): void => {
-    if (state.compareMode !== "split") return;
-
-    const handle = stage.querySelector<HTMLElement>(".compare-split-handle");
-    if (!handle) return;
-
     const onPointerMove = (e: PointerEvent) => {
-      if (!isDraggingSplitter) return;
+      if (!isDraggingSplitter || state.compareMode !== "split") return;
       const rect = stage.getBoundingClientRect();
       const pct = ((e.clientX - rect.left) / rect.width) * 100;
       updateSplitterPosition(pct);
     };
 
     const onPointerUp = (e: PointerEvent) => {
+      const handle = stage.querySelector<HTMLElement>(".compare-split-handle");
       if (isDraggingSplitter) {
         isDraggingSplitter = false;
-        handle.classList.remove("is-dragging");
+        handle?.classList.remove("is-dragging");
         try {
-          handle.releasePointerCapture(e.pointerId);
+          handle?.releasePointerCapture(e.pointerId);
         } catch {
           // ignore
         }
@@ -379,7 +392,9 @@ export function createCompareView(actions: ViewActions): CompareViewController {
       window.removeEventListener("pointercancel", onPointerUp);
     };
 
-    handle.addEventListener("pointerdown", (e: PointerEvent) => {
+    const handle = stage.querySelector<HTMLElement>(".compare-split-handle");
+    handle?.addEventListener("pointerdown", (e: PointerEvent) => {
+      if (state.compareMode !== "split") return;
       e.preventDefault();
       e.stopPropagation();
       isDraggingSplitter = true;
@@ -394,26 +409,31 @@ export function createCompareView(actions: ViewActions): CompareViewController {
       window.addEventListener("pointercancel", onPointerUp);
     });
 
-    stage.addEventListener("pointerdown", (e: PointerEvent) => {
-      if ((e.target as HTMLElement).closest(".canvas-dock, .frosted-badge, .compare-split-handle")) {
-        return;
-      }
-      if (state.compareMode === "toggle") {
-        state.compareShowOriginal = !state.compareShowOriginal;
-        renderStage();
-        return;
-      }
-      if (state.compareMode === "split") {
-        const rect = stage.getBoundingClientRect();
-        const pct = ((e.clientX - rect.left) / rect.width) * 100;
-        updateSplitterPosition(pct);
-        isDraggingSplitter = true;
-        handle.classList.add("is-dragging");
-        window.addEventListener("pointermove", onPointerMove);
-        window.addEventListener("pointerup", onPointerUp);
-        window.addEventListener("pointercancel", onPointerUp);
-      }
-    });
+    // The stage element is persistent while its innerHTML is replaced. Bind the
+    // canvas listener once so re-renders cannot stack duplicate handlers.
+    if (!stagePointerBound) {
+      stagePointerBound = true;
+      stage.addEventListener("pointerdown", (e: PointerEvent) => {
+        if ((e.target as HTMLElement).closest(".canvas-dock, .frosted-badge, .compare-split-handle")) {
+          return;
+        }
+        if (state.compareMode === "toggle") {
+          state.compareShowOriginal = !state.compareShowOriginal;
+          renderStage();
+          return;
+        }
+        if (state.compareMode === "split") {
+          const rect = stage.getBoundingClientRect();
+          const pct = ((e.clientX - rect.left) / rect.width) * 100;
+          updateSplitterPosition(pct);
+          isDraggingSplitter = true;
+          stage.querySelector<HTMLElement>(".compare-split-handle")?.classList.add("is-dragging");
+          window.addEventListener("pointermove", onPointerMove);
+          window.addEventListener("pointerup", onPointerUp);
+          window.addEventListener("pointercancel", onPointerUp);
+        }
+      });
+    }
   };
 
   const setupDockEvents = (): void => {
@@ -422,6 +442,17 @@ export function createCompareView(actions: ViewActions): CompareViewController {
 
     const btn100 = document.getElementById("btnDock100");
     btn100?.addEventListener("click", () => setZoom(1));
+
+    const timeSlider = document.getElementById("compareTimeSlider") as HTMLInputElement | null;
+    const timeOut = document.getElementById("compareTimeOut");
+    timeSlider?.addEventListener("input", () => {
+      if (timeOut) timeOut.textContent = fmtTime(Number(timeSlider.value));
+    });
+    timeSlider?.addEventListener("change", () => {
+      if (state.compareRel) {
+        void run(state.compareRel, activeFormat, Number(timeSlider.value));
+      }
+    });
 
     const dockGroup = document.getElementById("dockModeGroup");
     dockGroup?.addEventListener("click", (e) => {
@@ -455,7 +486,11 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     $("compareRail").classList.add("hidden");
   };
 
-  const run = async (rel: string, format?: OutputFormat): Promise<void> => {
+  const run = async (
+    rel: string,
+    format?: OutputFormat,
+    timestampSec?: number,
+  ): Promise<void> => {
     if (busy) return;
     busy = true;
     state.compareRel = rel;
@@ -474,7 +509,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     $("compareRail").classList.add("hidden");
 
     try {
-      const data = await actions.runCompare(rel, activeFormat);
+      const data = await actions.runCompare(rel, activeFormat, timestampSec);
       state.compare = data;
       if (!data.variants.length) {
         renderEmpty(
@@ -610,7 +645,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     if (!state.compare) return;
     const variant = state.compare.variants[state.compareVariant];
     if (!variant) return;
-    actions.setQuality(variant.quality);
+    actions.setQuality(variant.quality, state.compare.format);
     const fmtName = state.compare.format.toUpperCase();
     actions.toast(`Quality set to q${variant.quality} for ${fmtName}.`, "success");
   });
@@ -620,7 +655,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     if (!state.compare) return;
     const variant = state.compare.variants[state.compareVariant];
     if (!variant) return;
-    actions.setQuality(variant.quality);
+    actions.setQuality(variant.quality, state.compare.format);
     const fmtName = state.compare.format.toUpperCase();
     actions.toast(`q${variant.quality} set as default for ${fmtName}.`, "success");
   });

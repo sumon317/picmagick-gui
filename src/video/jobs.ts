@@ -2,10 +2,9 @@
  * Video job lifecycle: start, stream intra-file + overall progress over SSE,
  * instant OS-level pause/resume/cancel, and undoable manifest writing.
  */
-import { dlopen, FFIType } from "bun:ffi";
 import { EventEmitter } from "node:events";
 import type { FileResult } from "../convert.ts";
-import { applyProcessCpuLimit } from "../cpu.ts";
+import { applyProcessCpuLimit, resumeProcess, suspendProcess } from "../cpu.ts";
 import type { OutputFormat } from "../formats.ts";
 import type { JobState, Progress } from "../jobs.ts";
 import { writeManifest } from "../manifest.ts";
@@ -19,66 +18,6 @@ import type { VideoDecision, VideoPolicy } from "./policy.ts";
 // --------------------------------------------------------------------------
 // OS Process Suspend / Resume for instant mid-video pause
 // --------------------------------------------------------------------------
-
-type WinSuspendBindings = {
-  k32: {
-    symbols: {
-      OpenProcess: (access: number, inherit: boolean, pid: number) => any;
-      CloseHandle: (handle: any) => boolean;
-    };
-  };
-  ntdll: {
-    symbols: {
-      NtSuspendProcess: (handle: any) => number;
-      NtResumeProcess: (handle: any) => number;
-    };
-  };
-};
-
-let winBindings: WinSuspendBindings | null = null;
-if (process.platform === "win32") {
-  try {
-    const k32 = dlopen("kernel32.dll", {
-      OpenProcess: { args: [FFIType.u32, FFIType.bool, FFIType.u32], returns: FFIType.ptr },
-      CloseHandle: { args: [FFIType.ptr], returns: FFIType.bool },
-    });
-    const ntdll = dlopen("ntdll.dll", {
-      NtSuspendProcess: { args: [FFIType.ptr], returns: FFIType.i32 },
-      NtResumeProcess: { args: [FFIType.ptr], returns: FFIType.i32 },
-    });
-    winBindings = { k32: k32 as any, ntdll: ntdll as any };
-  } catch {
-    winBindings = null;
-  }
-}
-
-const PROCESS_SUSPEND_RESUME = 0x0800;
-
-function setProcessSuspended(pid: number, suspend: boolean): boolean {
-  if (!pid || pid <= 0) return false;
-  if (process.platform === "linux") {
-    try {
-      process.kill(pid, suspend ? "SIGSTOP" : "SIGCONT");
-      return true;
-    } catch {
-      return false;
-    }
-  }
-  if (winBindings) {
-    try {
-      const handle = winBindings.k32.symbols.OpenProcess(PROCESS_SUSPEND_RESUME, false, pid);
-      if (!handle) return false;
-      const status = suspend
-        ? winBindings.ntdll.symbols.NtSuspendProcess(handle)
-        : winBindings.ntdll.symbols.NtResumeProcess(handle);
-      winBindings.k32.symbols.CloseHandle(handle);
-      return status === 0;
-    } catch {
-      return false;
-    }
-  }
-  return false;
-}
 
 export type VideoStartOptions = {
   decisions: VideoDecision[];
@@ -220,7 +159,7 @@ export class VideoJob extends EventEmitter {
     // If in-flight FFmpeg processes were OS-suspended, wake them up immediately
     if (this.osSuspended && this.activePids.size > 0) {
       for (const pid of this.activePids) {
-        setProcessSuspended(pid, false);
+        resumeProcess(pid);
       }
       this.osSuspended = false;
       this.pauseRequested = false;
@@ -255,7 +194,7 @@ export class VideoJob extends EventEmitter {
 
     let anySuspended = false;
     for (const pid of this.activePids) {
-      if (setProcessSuspended(pid, true)) {
+      if (suspendProcess(pid)) {
         anySuspended = true;
       }
     }
@@ -280,7 +219,7 @@ export class VideoJob extends EventEmitter {
     // Wake any suspended processes before aborting so they can exit and clean up .part files
     if (this.osSuspended) {
       for (const pid of this.activePids) {
-        setProcessSuspended(pid, false);
+        resumeProcess(pid);
       }
       this.osSuspended = false;
     }
@@ -426,7 +365,7 @@ export class VideoJob extends EventEmitter {
         at: Date.now(),
         jobId: this.id,
         manifestId,
-        summary: this.summary(result.bytes, cancelled ? "cancelled" : undefined),
+        summary: this.summary(this.totals.bytes, cancelled ? "cancelled" : undefined),
       } satisfies Progress);
     } catch (err) {
       this.state = "failed";

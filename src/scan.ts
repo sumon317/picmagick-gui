@@ -122,7 +122,9 @@ const IGNORED_DIRS = new Set([
  */
 const IGNORED_PATTERNS = [
   /^image[_-]?magick/i,
+  /^ffmpeg$/i,
   /^picmag\w*-gui$/i,
+  /^compakta$/i,
   /^\.[^.]/,          // dot-folders: .stfolder, .git, .cache, .thumbnails
   /^\$/,              // Windows system dirs
 ];
@@ -207,7 +209,7 @@ export async function scanLibrary(
   (function prune(node: TreeNode) {
     for (const child of node.children) {
       prune(child);
-      if (child.imageCount === 0 && child.rawCount === 0) {
+      if (child.imageCount === 0 && child.rawCount === 0 && child.videoCount === 0) {
         deadFolders.push(child.rel);
       }
     }

@@ -19,6 +19,9 @@ import path from "node:path";
 import type { Decision } from "./policy.ts";
 import { outputPathFor, type Policy } from "./policy.ts";
 import { pathKey } from "./platform.ts";
+import { VIDEO_EXTS, extOf } from "./paths.ts";
+
+const VIDEO_EXT_SET = new Set<string>(VIDEO_EXTS);
 
 export type SyncState = "new" | "changed" | "upToDate";
 
@@ -40,6 +43,8 @@ export type SyncReport = {
   /** Source bytes still to be processed. */
   pendingSourceBytes: number;
   pendingCount: number;
+  /** Total orphans found, before the display list is capped at 200. */
+  orphanCount: number;
   orphans: { out: string; bytes: number }[];
   orphanBytes: number;
   entries: SyncEntry[];
@@ -72,6 +77,7 @@ export async function analyseSync(
         let anyStale = false;
         let outBytes: number | null = null;
         let reason: string | undefined;
+        let matchedOut: string | null = outs[0] ?? null;
 
         for (const o of outs) {
           expected.add(pathKey(path.resolve(o)));
@@ -84,7 +90,9 @@ export async function analyseSync(
               reason = "output is empty";
               continue;
             }
-            if (st.mtimeMs < d.file.mtime) {
+            // Filesystem timestamp precision varies across NTFS/ext4/exFAT, so
+            // allow a one-second rounding window before calling an output stale.
+            if (st.mtimeMs + 1000 < d.file.mtime) {
               allPresent = false;
               anyStale = true;
               reason = "output older than source";
@@ -94,13 +102,41 @@ export async function analyseSync(
           }
         }
 
+        // The smaller-only guard can keep the original bytes instead of writing
+        // a converted file. Register that copy path as expected so it is never
+        // reported as an orphan, then use it as a finished output when the
+        // converted variants are missing or stale.
+        const guardApplies =
+          policy.qualities.length === 1 && policy.skipAlreadyEfficient !== false;
+        let copyOut: string | null = null;
+        if (guardApplies) {
+          const copyDecision: Decision = { ...d, verdict: "copy", reason: "undersized" };
+          copyOut = outputPathFor(copyDecision, sourceRoot, destination, policy);
+          expected.add(pathKey(path.resolve(copyOut)));
+        }
+
+        if (copyOut && (!allPresent || anyStale)) {
+          try {
+            const st = await stat(copyOut);
+            if (st.size > 0 && st.mtimeMs + 1000 >= d.file.mtime) {
+              allPresent = true;
+              anyStale = false;
+              outBytes = st.size;
+              reason = undefined;
+              matchedOut = copyOut;
+            }
+          } catch {
+            /* no copy fallback */
+          }
+        }
+
         const state: SyncState = !allPresent
           ? anyStale ? "changed" : "new"
           : "upToDate";
 
         entries.push({
           rel: d.file.rel,
-          out: outs[0] ?? null,
+          out: matchedOut,
           state,
           sourceBytes: d.file.size,
           outputBytes: outBytes,
@@ -124,8 +160,10 @@ export async function analyseSync(
       if (e.isDirectory()) { await walk(full); continue; }
       if (!e.isFile()) continue;
       if (e.name.startsWith(".picmagic-manifest-") || e.name.startsWith(".compakta-manifest-")) continue;
-      // In merge mode, video files sharing the photo destination tree are not photo orphans
-      if (/\.(mp4|mkv|webm|mov|m4v|avi)$/i.test(e.name)) continue;
+      if (e.name.includes(".part")) continue;
+      // In merge mode, video files sharing the photo destination tree are not
+      // photo orphans. Use the full list, not a hardcoded subset.
+      if (VIDEO_EXT_SET.has(extOf(e.name))) continue;
       if (expected.has(pathKey(path.resolve(full)))) continue;
       try {
         const st = await stat(full);
@@ -147,6 +185,7 @@ export async function analyseSync(
     upToDateCount: entries.filter((e) => e.state === "upToDate").length,
     pendingCount: pending.length,
     pendingSourceBytes: pending.reduce((a, e) => a + e.sourceBytes, 0),
+    orphanCount: orphans.length,
     orphans: orphans.sort((a, b) => b.bytes - a.bytes).slice(0, 200),
     orphanBytes,
     entries,
@@ -160,4 +199,58 @@ export function pendingOnly(decisions: Decision[], report: SyncReport): Decision
     report.entries.filter((e) => e.state !== "upToDate").map((e) => e.rel),
   );
   return decisions.filter((d) => pending.has(d.file.rel));
+}
+
+export type CleanOrphansResult = {
+  removed: number;
+  bytesFreed: number;
+  refused: number;
+  errors: string[];
+};
+
+/**
+ * Deletes only orphan files verified to sit strictly inside `destination`.
+ * Never touches manifest files or paths outside `destination`.
+ */
+export async function cleanOrphans(
+  destination: string,
+  orphans: { out: string; bytes: number }[],
+): Promise<CleanOrphansResult> {
+  const { rm, rmdir } = await import("node:fs/promises");
+  const resolvedDest = path.resolve(destination);
+  const destRoot = pathKey(resolvedDest);
+  const res: CleanOrphansResult = { removed: 0, bytesFreed: 0, refused: 0, errors: [] };
+  const candidateDirs = new Set<string>();
+
+  for (const item of orphans) {
+    const target = path.resolve(item.out);
+    const base = path.basename(target);
+    if (
+      !pathKey(target).startsWith(destRoot + path.sep) ||
+      base.startsWith(".compakta-manifest-") ||
+      base.startsWith(".picmagic-manifest-")
+    ) {
+      res.refused++;
+      continue;
+    }
+    try {
+      await rm(target, { force: true });
+      res.removed++;
+      res.bytesFreed += item.bytes;
+      let dir = path.dirname(target);
+      while (pathKey(dir).startsWith(destRoot + path.sep)) {
+        candidateDirs.add(dir);
+        dir = path.dirname(dir);
+      }
+    } catch (err) {
+      res.errors.push(`${target}: ${(err as Error).message}`);
+    }
+  }
+
+  const sortedDirs = [...candidateDirs].sort((a, b) => b.length - a.length);
+  for (const dir of sortedDirs) {
+    await rmdir(dir).catch(() => {});
+  }
+
+  return res;
 }

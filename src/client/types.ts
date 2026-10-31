@@ -100,6 +100,9 @@ export type Policy = {
   qualities: number[];
   flattenGif: boolean;
   heicSpeed: number;
+  maxResolution?: number;
+  skipAlreadyEfficient?: boolean;
+  stripMetadata?: boolean;
 };
 
 export type ScannedFile = {
@@ -252,6 +255,8 @@ export type PreviewResponse = {
   budget: BudgetPlan;
   health: HealthReport;
   freeBytes: number | null;
+  otherModeBytes?: number;
+  otherModeCount?: number;
 };
 
 export type Estimate = {
@@ -414,6 +419,8 @@ export type CompareResponse = {
   originalBytes: number;
   originalExt?: string;
   mtime?: number;
+  durationSec?: number;
+  timestampSec?: number;
   variants: CompareVariant[];
   errors: string[];
 };

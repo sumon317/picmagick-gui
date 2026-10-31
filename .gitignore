@@ -23,6 +23,7 @@ artifacts/
 # Local demo media and generated comparison previews are not part of the app.
 demo-images/
 .preview-cache/
+.compakta-settings.json
 demo-images-out/
 demo-vids/
 demo-vids-*/

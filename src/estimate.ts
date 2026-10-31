@@ -48,6 +48,7 @@ function magick(args: string[], exe: string): Promise<number> {
   return new Promise((resolve) => {
     const c = spawn(exe, args, {
       windowsHide: true,
+      stdio: "ignore",
       env: {
         ...process.env,
         MAGICK_THREAD_LIMIT: "1",
@@ -117,12 +118,22 @@ export async function estimateFromSample(opts: {
           format: opts.policy.outputFormat,
           quality: q,
           speed: opts.policy.heicSpeed,
+          maxResolution: opts.policy.maxResolution,
+          stripMetadata: opts.policy.stripMetadata,
         }),
         opts.magickPath,
       );
       if (code !== 0) return;
       try {
-        producedBytes += (await stat(out)).size;
+        const st = await stat(out);
+        // The smaller-only guard keeps the source bytes when a single-quality
+        // encode would be larger, so the sample must not project the inflated
+        // size either.
+        const measured =
+          opts.policy.skipAlreadyEfficient !== false && opts.policy.qualities.length === 1
+            ? Math.min(st.size, d.file.size)
+            : st.size;
+        producedBytes += measured;
         producedCount++;
       } catch { /* no output */ }
     },

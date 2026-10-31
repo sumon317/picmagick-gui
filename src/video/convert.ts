@@ -10,7 +10,7 @@
  *    throttling (`src/cpu.ts`) keep the UI responsive and the machine cool.
  */
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, rename, rm, stat } from "node:fs/promises";
+import { copyFile, mkdir, rename, rm, stat, utimes } from "node:fs/promises";
 import path from "node:path";
 
 import { runPool, type ConversionSummary, type FileResult } from "../convert.ts";
@@ -217,6 +217,8 @@ async function processOneVideo(
       }
       await mkdir(path.dirname(out), { recursive: true });
       await copyFile(src, out);
+      const copyMtime = new Date(d.file.mtime);
+      await utimes(out, copyMtime, copyMtime).catch(() => {});
       const st = await stat(out);
       return {
         ...base,
@@ -269,6 +271,8 @@ async function processOneVideo(
         }
         await mkdir(path.dirname(copyOut), { recursive: true });
         await copyFile(src, copyOut);
+        const efficientMtime = new Date(d.file.mtime);
+        await utimes(copyOut, efficientMtime, efficientMtime).catch(() => {});
         const st = await stat(copyOut);
         return {
           ...base,
@@ -370,7 +374,18 @@ async function processOneVideo(
         o.effectiveDestination,
         o.policy,
       );
+      if (!(await overwriteOk(copyOut, o.overwrite))) {
+        return {
+          ...base,
+          out: copyOut,
+          status: "skipped",
+          seconds: (Date.now() - started) / 1000,
+        };
+      }
+      await mkdir(path.dirname(copyOut), { recursive: true });
       await copyFile(src, copyOut);
+      const guardMtime = new Date(d.file.mtime);
+      await utimes(copyOut, guardMtime, guardMtime).catch(() => {});
       const origSt = await stat(copyOut);
       return {
         ...base,
@@ -383,6 +398,8 @@ async function processOneVideo(
 
     await rename(partOut, finalOut);
     partOut = null;
+    const finalMtime = new Date(d.file.mtime);
+    await utimes(finalOut, finalMtime, finalMtime).catch(() => {});
 
     return {
       ...base,

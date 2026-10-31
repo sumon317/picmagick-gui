@@ -1,11 +1,13 @@
 /**
  * Content-hash duplicate detection.
  *
- * Size + name matching alone produces false positives (WhatsApp re-exports,
- * camera bursts). MD5 of the bytes is decisive. Files are streamed in chunks so
- * a 65 MB RAW does not land in memory all at once.
+ * Uses a three-tier pipeline so multi-gigabyte video and RAW libraries scan fast:
+ *   1. Group by exact byte size.
+ *   2. For files > 256 KB, hash a 192 KB fingerprint (first, middle, last 64 KB).
+ *   3. Stream-hash full MD5 only on candidates whose partial fingerprints collide.
  */
 import { createReadStream } from "node:fs";
+import { open } from "node:fs/promises";
 import { createHash } from "node:crypto";
 import type { ScannedFile } from "./scan.ts";
 import type { Policy } from "./policy.ts";
@@ -16,7 +18,7 @@ export type DuplicateGroup = {
   hash: string;
   size: number;
   members: { rel: string; abs: string; size: number; category: string }[];
-  /** rel paths of members that are inside excluded folders */
+  /** True when members live under more than one top-level folder. */
   spreadAcrossFolders: boolean;
 };
 
@@ -29,7 +31,27 @@ export type DedupeResult = {
   durationMs: number;
 };
 
-function hashFile(abs: string): Promise<string> {
+const CHUNK_BYTES = 64 * 1024;
+const PARTIAL_THRESHOLD = CHUNK_BYTES * 4; // 256 KB
+
+async function partialHashFile(abs: string, size: number): Promise<string> {
+  if (size <= PARTIAL_THRESHOLD) return fullHashFile(abs);
+  const fh = await open(abs, "r");
+  try {
+    const buf = Buffer.allocUnsafe(CHUNK_BYTES);
+    const h = createHash("md5");
+    const offsets = [0, Math.floor(size / 2) - Math.floor(CHUNK_BYTES / 2), size - CHUNK_BYTES];
+    for (const offset of offsets) {
+      const { bytesRead } = await fh.read(buf, 0, CHUNK_BYTES, Math.max(0, offset));
+      h.update(buf.subarray(0, bytesRead));
+    }
+    return h.digest("hex");
+  } finally {
+    await fh.close();
+  }
+}
+
+function fullHashFile(abs: string): Promise<string> {
   return new Promise((resolve, reject) => {
     const h = createHash("md5");
     const s = createReadStream(abs);
@@ -47,7 +69,8 @@ export function candidatesBySize(files: ScannedFile[], policy: Policy): ScannedF
     if (classify(f, policy).verdict === "skip") continue;
     if (f.size === 0) continue;
     const arr = bySize.get(f.size);
-    if (arr) arr.push(f); else bySize.set(f.size, [f]);
+    if (arr) arr.push(f);
+    else bySize.set(f.size, [f]);
   }
   for (const [, arr] of bySize) if (arr.length > 1) out.push(...arr);
   return out;
@@ -62,29 +85,65 @@ export async function findDuplicates(
   const maxHash = opts.maxHash ?? 40_000;
   const cands = candidatesBySize(files, policy).slice(0, maxHash);
 
-  // Hash with a small concurrency cap; disk I/O bound anyway.
   const CONC = 8;
-  const hashes = new Map<string, ScannedFile[]>();
-  let hashedFiles = 0;
-  let hashedBytes = 0;
+  const partialGroups = new Map<string, ScannedFile[]>();
   let cursor = 0;
 
+  // Stage 1: Fast partial fingerprint (or full hash if <= 256 KB)
   await Promise.all(
     Array.from({ length: CONC }, async () => {
       while (cursor < cands.length) {
         if (opts.signal?.aborted) return;
         const f = cands[cursor++];
-        let hash: string;
         try {
-          hash = await hashFile(f.abs);
+          const pHash = await partialHashFile(f.abs, f.size);
+          const key = `${f.size}:${pHash}`;
+          const arr = partialGroups.get(key);
+          if (arr) arr.push(f);
+          else partialGroups.set(key, [f]);
         } catch {
           continue;
         }
-        hashedFiles++;
-        hashedBytes += f.size;
-        const arr = hashes.get(hash);
-        if (arr) arr.push(f); else hashes.set(hash, [f]);
-        opts.onProgress?.(hashedFiles, cands.length);
+      }
+    }),
+  );
+
+  // Stage 2: Full MD5 stream only for files whose partial fingerprints collided
+  const hashes = new Map<string, ScannedFile[]>();
+  const needFullHash: ScannedFile[] = [];
+  let hashedFiles = 0;
+  let hashedBytes = 0;
+
+  for (const [key, members] of partialGroups) {
+    if (members.length < 2) continue;
+    if (members[0].size <= PARTIAL_THRESHOLD) {
+      // Partial hash already read the entire file
+      const md5 = key.slice(key.indexOf(":") + 1);
+      hashes.set(md5, members);
+      hashedFiles += members.length;
+      hashedBytes += members[0].size * members.length;
+    } else {
+      needFullHash.push(...members);
+    }
+  }
+
+  let fullCursor = 0;
+  await Promise.all(
+    Array.from({ length: CONC }, async () => {
+      while (fullCursor < needFullHash.length) {
+        if (opts.signal?.aborted) return;
+        const f = needFullHash[fullCursor++];
+        try {
+          const hash = await fullHashFile(f.abs);
+          hashedFiles++;
+          hashedBytes += f.size;
+          const arr = hashes.get(hash);
+          if (arr) arr.push(f);
+          else hashes.set(hash, [f]);
+          opts.onProgress?.(hashedFiles, needFullHash.length);
+        } catch {
+          continue;
+        }
       }
     }),
   );
@@ -102,7 +161,10 @@ export async function findDuplicates(
       hash,
       size,
       members: members.map((m) => ({
-        rel: m.rel, abs: m.abs, size: m.size, category: m.category,
+        rel: m.rel,
+        abs: m.abs,
+        size: m.size,
+        category: m.category,
       })),
       spreadAcrossFolders: folders.size > 1,
     });
@@ -110,7 +172,7 @@ export async function findDuplicates(
     duplicateBytes += size * (members.length - 1);
   }
 
-  groups.sort((a, b) => (b.size * (b.members.length - 1)) - (a.size * (a.members.length - 1)));
+  groups.sort((a, b) => b.size * (b.members.length - 1) - a.size * (a.members.length - 1));
 
   return {
     groups,

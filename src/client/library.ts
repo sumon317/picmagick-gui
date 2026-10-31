@@ -226,6 +226,71 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     return row;
   };
 
+  const FILE_CHUNK_SIZE = 150;
+
+  const scrollRoot = box.closest(".library-scroll") as HTMLElement | null;
+  const chunkObserver =
+    "IntersectionObserver" in window
+      ? new IntersectionObserver(
+          (entries) => {
+            for (const entry of entries) {
+              if (!entry.isIntersecting) continue;
+              const sentinel = entry.target as HTMLElement & { _loadMore?: () => void };
+              sentinel._loadMore?.();
+            }
+          },
+          { root: scrollRoot, rootMargin: "240px 0px" },
+        )
+      : null;
+
+  /**
+   * Append file rows in batches so expanding a 5,000-photo folder stays fast.
+   * A sentinel at the end of the batch loads the next 150 rows when it scrolls
+   * into view; clicking it works too for keyboard users and when the observer
+   * is unavailable.
+   */
+  const appendFilesChunked = (
+    container: HTMLElement,
+    files: ScannedFile[],
+    depth: number,
+    ctx: SelectionContext,
+  ): void => {
+    let offset = 0;
+
+    const renderNextBatch = (): void => {
+      const slice = files.slice(offset, offset + FILE_CHUNK_SIZE);
+      offset += slice.length;
+      const frag = document.createDocumentFragment();
+      for (const file of slice) {
+        frag.append(fileRow(file, depth, ctx));
+      }
+      container.append(frag);
+
+      if (offset < files.length) {
+        const remaining = files.length - offset;
+        const sentinel = document.createElement("button") as HTMLButtonElement & {
+          _loadMore?: () => void;
+        };
+        sentinel.type = "button";
+        sentinel.className = "tree-row muted";
+        sentinel.style.paddingLeft = `${8 + depth * 14}px`;
+        sentinel.textContent = `Show ${Math.min(FILE_CHUNK_SIZE, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)…`;
+
+        const trigger = (): void => {
+          chunkObserver?.unobserve(sentinel);
+          sentinel.remove();
+          renderNextBatch();
+        };
+        sentinel._loadMore = trigger;
+        sentinel.addEventListener("click", trigger, { once: true });
+        container.append(sentinel);
+        chunkObserver?.observe(sentinel);
+      }
+    };
+
+    renderNextBatch();
+  };
+
   type SelectionContext = {
     opts: { sep: string; caseInsensitive: boolean };
     ex: ReadonlySet<string>;
@@ -353,8 +418,13 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     const buildKids = (): void => {
       if (built) return;
       built = true;
-      for (const file of visibleFiles(node.files, ctx.q, selfMatch)) {
-        kids.append(fileRow(file, node.depth + 1, ctx));
+      const filesToRender = visibleFiles(node.files, ctx.q, selfMatch);
+      if (filesToRender.length) {
+        // Keep chunked files above child folders even when later batches load.
+        const fileHost = document.createElement("div");
+        fileHost.style.display = "contents";
+        kids.append(fileHost);
+        appendFilesChunked(fileHost, filesToRender, node.depth + 1, ctx);
       }
       for (const child of [...node.children].sort(byName)) {
         const el = nodeElement(child, ctx, selfMatch);
@@ -388,6 +458,7 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
   const render = (): void => {
     const focusedRel = document.activeElement?.closest<HTMLElement>("[data-rel]")?.dataset.rel ?? null;
     const scrollTop = box.scrollTop;
+    chunkObserver?.disconnect();
     box.innerHTML = "";
 
     if (!state.tree) {
@@ -417,7 +488,7 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
       label.className = "tree-group-label";
       label.textContent = "Files in source root";
       box.append(label);
-      for (const file of rootFiles) box.append(fileRow(file, 0, ctx));
+      appendFilesChunked(box, rootFiles, 0, ctx);
     }
 
     for (const child of [...state.tree.children].sort(byName)) {

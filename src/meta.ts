@@ -47,19 +47,35 @@ const PROBE_FIELDS = [
 const PROBE = PROBE_FIELDS.map((f) => f.expr).join("\x1f");
 const SEP = "\x1f";
 
-export function identify(magickPath: string, file: string): Promise<ImageFacts> {
+export function identify(
+  magickPath: string,
+  file: string,
+  signal?: AbortSignal,
+): Promise<ImageFacts> {
+  if (signal?.aborted) {
+    return Promise.resolve({ path: file, ok: false, error: "aborted" });
+  }
   return new Promise((resolve) => {
     const c = spawn(magickPath, ["identify", "-quiet", "-format", PROBE, file + "[0]"], {
       windowsHide: true,
       env: { ...process.env, MAGICK_THREAD_LIMIT: "1" },
     });
+    const onAbort = () => {
+      try { c.kill(); } catch { /* already gone */ }
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+
     let out = "";
     let err = "";
     c.stdout.on("data", (d) => { if (out.length < 4000) out += String(d); });
     c.stderr.on("data", (d) => { if (err.length < 2000) err += String(d); });
-    c.on("error", (e) => resolve({ path: file, ok: false, error: String(e.message ?? e) }));
+    c.on("error", (e) => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve({ path: file, ok: false, error: String(e.message ?? e) });
+    });
     c.on("close", (code) => {
-      if (code !== 0 || !out.trim()) {
+      signal?.removeEventListener("abort", onAbort);
+      if (signal?.aborted || code !== 0 || !out.trim()) {
         resolve({ path: file, ok: false, error: err.trim().slice(0, 300) || `exit ${code}` });
         return;
       }
@@ -84,14 +100,15 @@ export async function identifyMany(
   magickPath: string,
   files: string[],
   jobs = 8,
+  signal?: AbortSignal,
 ): Promise<ImageFacts[]> {
   const out: ImageFacts[] = [];
   let cursor = 0;
   await Promise.all(
-    Array.from({ length: Math.max(1, Math.min(jobs, files.length)) }, async () => {
-      while (cursor < files.length) {
+    Array.from({ length: Math.max(1, Math.min(jobs, files.length || 1)) }, async () => {
+      while (cursor < files.length && !signal?.aborted) {
         const f = files[cursor++];
-        out.push(await identify(magickPath, f));
+        out.push(await identify(magickPath, f, signal));
       }
     }),
   );

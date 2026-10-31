@@ -78,6 +78,12 @@ export type VideoDecision = {
   file: ScannedFile;
   verdict: VideoVerdict;
   reason: string;
+  /**
+   * Appended to the output stem when a sibling in the same folder would
+   * otherwise land on the identical output path (`CLIP.MOV` + `CLIP.MP4`
+   * -> `CLIP-mov.mp4` + `CLIP-mp4.mp4`).
+   */
+  outStemSuffix?: string;
 };
 
 export type VideoPreview = {
@@ -180,26 +186,74 @@ export function videoOutputPathFor(
   const dir = decision.file.dir === "." ? "" : decision.file.dir;
   const ext = path.extname(decision.file.name);
   const base = ext ? decision.file.name.slice(0, -ext.length) : decision.file.name;
-  return path.join(effectiveDest, dir, `${base}.${outExt}`);
+  return path.join(effectiveDest, dir, `${base}${decision.outStemSuffix ?? ""}.${outExt}`);
 }
 
 function pathMatches(a: string, b: string): boolean {
   return CASE_INSENSITIVE ? a.toLowerCase() === b.toLowerCase() : a === b;
 }
 
-function folderInRules(rules: string[], dir: string): boolean {
-  if (!dir || dir === ".") return false;
+/** Fold a destination-relative path so collision keys follow platform case rules. */
+function claimKey(dir: string, name: string): string {
+  const joined = path.join(dir === "." ? "" : dir, name).replace(/[\\/]+/g, "/");
+  return CASE_INSENSITIVE ? joined.toLowerCase() : joined;
+}
+
+/**
+ * Mark convert decisions whose output path would collide with a sibling.
+ *
+ * Copies keep their original filename, so they claim that name; a convert that
+ * maps onto the same path gets its source extension appended, e.g.
+ * `CLIP.MOV` -> `CLIP-mov.mp4`. Storing the suffix on the decision keeps run,
+ * sync, and estimate in agreement.
+ */
+function annotateVideoCollisions(
+  convert: VideoDecision[],
+  copy: VideoDecision[],
+  targetExt: string,
+): void {
+  const claims = [
+    ...convert.map((d) => {
+      const ext = path.extname(d.file.name);
+      const base = ext ? d.file.name.slice(0, -ext.length) : d.file.name;
+      return {
+        d,
+        key: claimKey(d.file.dir, `${base}.${targetExt}`),
+        ext: d.file.ext || extOf(d.file.name),
+      };
+    }),
+    ...copy.map((d) => ({
+      d,
+      key: claimKey(d.file.dir, d.file.name),
+      ext: d.file.ext || extOf(d.file.name),
+    })),
+  ];
+
+  const counts = new Map<string, number>();
+  for (const c of claims) counts.set(c.key, (counts.get(c.key) ?? 0) + 1);
+
+  for (const c of claims) {
+    if (c.d.verdict === "convert" && (counts.get(c.key) ?? 0) > 1) {
+      c.d.outStemSuffix = `-${c.ext}`;
+    }
+  }
+}
+
+function longestMatchingFolder(rules: string[], dir: string): number {
+  if (!dir || dir === ".") return -1;
+  let maxLen = -1;
   for (const r of rules) {
-    if (pathMatches(dir, r)) return true;
-    if (
+    if (pathMatches(dir, r)) {
+      if (r.length > maxLen) maxLen = r.length;
+    } else if (
       dir.length > r.length &&
       (dir[r.length] === "/" || dir[r.length] === "\\") &&
       pathMatches(dir.slice(0, r.length), r)
     ) {
-      return true;
+      if (r.length > maxLen) maxLen = r.length;
     }
   }
-  return false;
+  return maxLen;
 }
 
 function fileInRules(rules: string[], rel: string): boolean {
@@ -217,10 +271,12 @@ function classifyVideo(
     // Included explicitly
   } else if (fileInRules(policy.excludedFiles, rel)) {
     return { verdict: "skip", reason: "file-excluded" };
-  } else if (folderInRules(policy.includedFolders, dir)) {
-    // Included explicitly
-  } else if (folderInRules(policy.excludedFolders, dir)) {
-    return { verdict: "skip", reason: "folder-excluded" };
+  } else {
+    const incLen = longestMatchingFolder(policy.includedFolders, dir);
+    const exLen = longestMatchingFolder(policy.excludedFolders, dir);
+    if (exLen > -1 && exLen >= incLen) {
+      return { verdict: "skip", reason: "folder-excluded" };
+    }
   }
 
   const ext = file.ext || extOf(file.name);
@@ -262,6 +318,9 @@ export function applyVideoPolicy(
     else if (verdict === "copy") copy.push(d);
     else skip.push(d);
   }
+
+  const outExt = policy.outputFormat === "vp9" ? "webm" : policy.container;
+  annotateVideoCollisions(convert, copy, outExt);
 
   const convertBytes = convert.reduce((a, d) => a + d.file.size, 0);
   const copyBytes = copy.reduce((a, d) => a + d.file.size, 0);

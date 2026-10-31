@@ -1,12 +1,12 @@
 /**
  * Health view — readiness verdict, system checks, format support, and the
- * managed ImageMagick build. Every value is server-reported; the view does not
- * infer writability from a format name.
+ * managed ImageMagick / FFmpeg build. Every value is server-reported; the view
+ * does not infer writability from a format name.
  */
 import { api } from "../api";
 import { $, escapeHtml, fmt, icon, relativeTime, shortVersion } from "../dom";
 import { state } from "../state";
-import type { HealthReport, OutputFormat, UpdateStatus } from "../types";
+import type { HealthReport, UpdateStatus } from "../types";
 import type { ViewActions } from "./shared";
 import { checkIcon, statusWord } from "./shared";
 
@@ -15,22 +15,58 @@ export type HealthViewController = {
   refresh: () => Promise<void>;
 };
 
+const VIDEO_FORMAT_ROWS: Record<string, { label: string; ext: string }> = {
+  av1: { label: "AV1 (CPU)", ext: "mkv / mp4" },
+  av1_hw: { label: "AV1 (GPU)", ext: "mkv / mp4" },
+  hevc: { label: "HEVC (CPU)", ext: "mkv / mp4" },
+  hevc_hw: { label: "HEVC (GPU)", ext: "mkv / mp4" },
+  vp9: { label: "VP9", ext: "webm" },
+};
+
 export function createHealthView(actions: ViewActions): HealthViewController {
   let busy = false;
   let lastHealth: HealthReport | null = null;
   let lastIm: UpdateStatus | null = null;
 
-  const supportRow = (format: OutputFormat): string => {
+  const supportRow = (format: string): string => {
+    const isVideo = state.mediaMode === "video";
+    const videoSpec = VIDEO_FORMAT_ROWS[format];
     const spec = state.formatSpecs[format];
-    const support = lastHealth?.magick?.formats?.[format] ?? state.status?.magick?.formats?.[format];
+    const formatMap = (
+      isVideo
+        ? lastHealth?.magick?.formats
+        : lastHealth?.magick?.formats ?? state.status?.magick?.formats
+    ) as Record<string, { mode?: string; writable?: boolean; detail?: string }> | undefined;
+    const support = formatMap?.[format];
     const writable = support?.writable ?? false;
     return `<tr>
-      <td>${escapeHtml(spec?.label ?? format)}</td>
-      <td class="mono">.${escapeHtml(spec?.ext ?? format)}</td>
+      <td>${escapeHtml(videoSpec?.label ?? spec?.label ?? format)}</td>
+      <td class="mono">${escapeHtml(videoSpec?.ext ?? `.${spec?.ext ?? format}`)}</td>
       <td class="mono">${escapeHtml(support?.mode ?? "—")}</td>
       <td class="${writable ? "support-yes" : "support-no"}">${writable ? "Writable" : "Not writable"}</td>
       <td class="muted">${escapeHtml(support?.detail ?? "No encoder reported.")}</td>
     </tr>`;
+  };
+
+  const ffmpegCard = (): string => {
+    const ff = lastHealth?.magick;
+    const hwAv1 = state.videoStatus?.ffmpeg?.hwEncoders?.av1;
+    const hwHevc = state.videoStatus?.ffmpeg?.hwEncoders?.hevc;
+    const lines: string[] = [];
+
+    if (ff) {
+      lines.push(`<div class="fact-row"><span>Installed</span><span>${escapeHtml(shortVersion(ff.version))}</span></div>`);
+      lines.push(`<div class="fact-row"><span>Path</span><span class="mono" title="${escapeHtml(ff.path)}">${escapeHtml(ff.path)}</span></div>`);
+      lines.push(`<div class="fact-row"><span>GPU encoders</span><span>${escapeHtml([hwAv1, hwHevc].filter(Boolean).join(", ") || "CPU only")}</span></div>`);
+    } else {
+      lines.push(`<div class="fact-row"><span>Installed</span><span style="color:var(--status-danger)">Not found</span></div>`);
+    }
+
+    return `<section class="health-section">
+      <div class="section-head"><h3>FFmpeg</h3><span class="chip ${ff ? "ok" : "warn"}">${ff ? "Ready" : "Missing"}</span></div>
+      <div class="fact-list">${lines.join("")}</div>
+      ${ff ? "" : `<div class="health-actions"><button class="btn primary sm" type="button" data-health-ffmpeg>Install FFmpeg</button></div>`}
+    </section>`;
   };
 
   const imCard = (): string => {
@@ -107,25 +143,38 @@ export function createHealthView(actions: ViewActions): HealthViewController {
       </div>`)
       .join("")}</div>`;
 
+    const isVideo = state.mediaMode === "video";
     const matrix = `<section class="health-section">
-      <div class="section-head"><h3>Format support</h3><span class="section-meta">${health.magick ? escapeHtml(shortVersion(health.magick.version)) : "ImageMagick not found"}</span></div>
+      <div class="section-head"><h3>Format support</h3><span class="section-meta">${
+        health.magick
+          ? escapeHtml(shortVersion(health.magick.version))
+          : isVideo
+            ? "FFmpeg not found"
+            : "ImageMagick not found"
+      }</span></div>
       <table class="data-table support-table">
         <thead><tr><th>Format</th><th>Extension</th><th>Mode</th><th>Status</th><th>Encoder</th></tr></thead>
-        <tbody>${(Object.keys(state.formatSpecs).length ? Object.keys(state.formatSpecs) : ["jxl", "avif", "webp", "heic", "jp2", "jpeg", "png"]).map((id) => supportRow(id as OutputFormat)).join("")}</tbody>
+        <tbody>${(isVideo
+          ? Object.keys(VIDEO_FORMAT_ROWS)
+          : Object.keys(state.formatSpecs).length
+            ? Object.keys(state.formatSpecs)
+            : ["jxl", "avif", "webp", "heic", "jp2", "jpeg", "png"]
+        ).map((id) => supportRow(id)).join("")}</tbody>
       </table>
     </section>`;
 
-    $("healthBody").innerHTML = banner + checks + matrix + imCard();
+    $("healthBody").innerHTML = banner + checks + matrix + (isVideo ? ffmpegCard() : imCard());
   };
 
   const refresh = async (): Promise<void> => {
     if (busy) return;
     busy = true;
-    $("healthBody").innerHTML = `<p class="empty-note">Reading ImageMagick, source, destination, and disk state…</p>`;
+    const isVideo = state.mediaMode === "video";
+    $("healthBody").innerHTML = `<p class="empty-note">Reading ${isVideo ? "FFmpeg" : "ImageMagick"}, source, destination, and disk state…</p>`;
     try {
       const [health, im] = await Promise.all([
         api<HealthReport>("health"),
-        actions.checkMagick(false),
+        isVideo ? Promise.resolve(null) : actions.checkMagick(false),
       ]);
       lastHealth = health;
       lastIm = im;
@@ -140,8 +189,17 @@ export function createHealthView(actions: ViewActions): HealthViewController {
   $("healthRecheck").addEventListener("click", () => void refresh());
 
   $("healthBody").addEventListener("click", (event) => {
-    if (!(event.target as HTMLElement).closest("[data-health-install]")) return;
-    void actions.installMagick().then(refresh);
+    const target = event.target as HTMLElement;
+    if (target.closest("[data-health-install]")) {
+      void actions.installMagick().then(refresh);
+    } else if (target.closest("[data-health-ffmpeg]")) {
+      void api("video/ffmpeg/install", { method: "POST", body: {} })
+        .then(() => {
+          actions.toast("FFmpeg installed successfully!", "success");
+          return refresh();
+        })
+        .catch((err: unknown) => actions.toast((err as Error).message, "danger"));
+    }
   });
 
   const open = (): void => {

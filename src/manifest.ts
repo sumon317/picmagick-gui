@@ -5,7 +5,7 @@
  * considers paths listed in a manifest, and refuses any path outside the
  * destination it was recorded against.
  */
-import { writeFile, readFile, rm, mkdir } from "node:fs/promises";
+import { writeFile, readFile, rm, rmdir } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import path from "node:path";
 import type { FileResult } from "./convert.ts";
@@ -105,6 +105,7 @@ export async function undoManifest(
 ): Promise<UndoResult> {
   const destRoot = pathKey(path.resolve(manifest.destination));
   const res: UndoResult = { removed: 0, missing: 0, bytesFreed: 0, refused: 0, errors: [] };
+  const candidateDirs = new Set<string>();
 
   for (const e of manifest.entries) {
     const target = path.resolve(e.out);
@@ -121,6 +122,11 @@ export async function undoManifest(
       try {
         await rm(target, { force: true });
         res.removed++;
+        let dir = path.dirname(target);
+        while (pathKey(dir).startsWith(destRoot + path.sep)) {
+          candidateDirs.add(dir);
+          dir = path.dirname(dir);
+        }
       } catch (err) {
         res.errors.push(`${target}: ${(err as Error).message}`);
       }
@@ -130,6 +136,13 @@ export async function undoManifest(
   }
 
   if (!opts.dryRun) {
+    // Prune empty directories deepest-first; rmdir fails harmlessly if non-empty.
+    const depth = (dir: string) => dir.split(path.sep).length;
+    const sortedDirs = [...candidateDirs].sort((a, b) => depth(b) - depth(a));
+    for (const dir of sortedDirs) {
+      await rmdir(dir).catch(() => {});
+    }
+
     await rm(manifestPath(manifest.destination, manifest.id), { force: true }).catch(() => {});
     await rm(path.join(manifest.destination, `.compakta-manifest-${manifest.id}.json`), { force: true }).catch(() => {});
     await rm(path.join(manifest.destination, `.picmagic-manifest-${manifest.id}.json`), { force: true }).catch(() => {});

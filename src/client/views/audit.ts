@@ -2,8 +2,9 @@
  * Audit drawer — Sync, Duplicates, and Dates.
  *
  * Each tab owns its own request, loading state, empty state, and error state.
- * Audits never mutate files; the only actions are selection changes (exclude
- * duplicates) and starting the incremental run that Sync proposes.
+ * Audits otherwise never mutate files; the only actions are selection changes
+ * (exclude duplicates), starting the incremental run that Sync proposes, and
+ * the explicitly confirmed orphan cleanup.
  */
 import { api } from "../api";
 import { $, escapeHtml, fmt } from "../dom";
@@ -32,12 +33,20 @@ export function createAuditView(actions: ViewActions): AuditViewController {
   let tab: AuditTab = "sync";
   let busy: AuditTab | null = null;
   let lastFocus: HTMLElement | null = null;
+  let auditController: AbortController | null = null;
   let syncData: SyncResponse | null = null;
   let dupeData: DuplicatesResponse | null = null;
   let datesData: DatesResponse | null = null;
 
   const drawer = $("auditDrawer");
   const backdrop = $("auditBackdrop");
+
+  /** Cancel any running audit, then hand out a fresh signal for the next one. */
+  const nextSignal = (): AbortSignal => {
+    auditController?.abort();
+    auditController = new AbortController();
+    return auditController.signal;
+  };
 
   const setTab = (next: AuditTab, fetchIt = true): void => {
     tab = next;
@@ -72,7 +81,10 @@ export function createAuditView(actions: ViewActions): AuditViewController {
         <div class="summary-stat"><span class="micro-label">Pending output</span><b>${fmt(data.estOutputBytes)}</b></div>
       </div>
       <p>${data.pendingSourceBytes ? `${fmt(data.pendingSourceBytes)} of source still needs work.` : "No source bytes are pending."}</p>
-      ${data.orphanCount ? `<p class="warn">${data.orphanCount.toLocaleString()} output file(s) (${fmt(data.orphanBytes)}) have no matching source. Left alone — nothing is deleted automatically.</p>` : ""}
+      ${data.orphanCount ? `<p class="warn">${data.orphanCount.toLocaleString()} output file(s) (${fmt(data.orphanBytes)}) have no matching source.</p>
+      <div class="drawer-actions" style="margin-bottom:8px">
+        <button class="btn danger sm" type="button" data-sync-clean-orphans>Remove ${data.orphanCount.toLocaleString()} orphan file(s) (${fmt(data.orphanBytes)})</button>
+      </div>` : ""}
       ${changed ? `<p class="muted">Changed: ${changed}${data.changed.length > 6 ? "…" : ""}</p>` : ""}
       ${pending
         ? `<div class="drawer-actions"><button class="btn primary sm" type="button" data-sync-run>Convert pending ${pending.toLocaleString()}</button><button class="btn ghost sm" type="button" data-audit-run="sync">Run again</button></div>`
@@ -85,7 +97,11 @@ export function createAuditView(actions: ViewActions): AuditViewController {
     busy = "sync";
     $("syncBox").innerHTML = loading("Comparing input against output…");
     try {
-      const data = await api<SyncResponse>("sync", { method: "POST", body: { policy: actions.policy() } });
+      const data = await api<SyncResponse>("sync", {
+        method: "POST",
+        body: { policy: actions.policy() },
+        signal: nextSignal(),
+      });
       renderSync(data);
     } catch (error) {
       $("syncBox").innerHTML = `<h4>Sync</h4>${errorBox((error as Error).message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="sync">Try again</button></div>`;
@@ -107,7 +123,10 @@ export function createAuditView(actions: ViewActions): AuditViewController {
       return;
     }
     const groups = data.groups.slice(0, 10);
-    const listed = groups.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0);
+    const totalRemovable = data.groups.reduce(
+      (sum, group) => sum + Math.max(0, group.members.length - 1),
+      0,
+    );
     $("dupeBox").innerHTML = `<div class="result-box">
       <h4>Duplicates <small>${data.groupCount.toLocaleString()} groups</small></h4>
       <p><b>${data.duplicateFiles.toLocaleString()}</b> files are duplicates, wasting <b>${fmt(data.duplicateBytes)}</b> if all converted.</p>
@@ -117,7 +136,7 @@ export function createAuditView(actions: ViewActions): AuditViewController {
       </div>`).join("")}
       ${data.groupCount > groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>` : ""}
       <div class="drawer-actions">
-        <button class="btn sm" type="button" data-exclude-dupes="${listed}">Exclude ${listed.toLocaleString()} duplicates</button>
+        <button class="btn sm" type="button" data-exclude-dupes="${totalRemovable}">Exclude ${totalRemovable.toLocaleString()} duplicates</button>
         <button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button>
       </div>
     </div>`;
@@ -128,7 +147,11 @@ export function createAuditView(actions: ViewActions): AuditViewController {
     busy = "duplicates";
     $("dupeBox").innerHTML = loading("Hashing files…");
     try {
-      const data = await api<DuplicatesResponse>("duplicates", { method: "POST", body: { maxHash: 6000 } });
+      const data = await api<DuplicatesResponse>("duplicates", {
+        method: "POST",
+        body: { maxHash: 6000, policy: actions.policy() },
+        signal: nextSignal(),
+      });
       renderDuplicates(data);
     } catch (error) {
       $("dupeBox").innerHTML = `<h4>Duplicates</h4>${errorBox((error as Error).message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="duplicates">Try again</button></div>`;
@@ -160,7 +183,11 @@ export function createAuditView(actions: ViewActions): AuditViewController {
     busy = "dates";
     $("datesBox").innerHTML = loading("Reading EXIF dates…");
     try {
-      const data = await api<DatesResponse>("dates", { method: "POST", body: {} });
+      const data = await api<DatesResponse>("dates", {
+        method: "POST",
+        body: { policy: actions.policy() },
+        signal: nextSignal(),
+      });
       renderDates(data);
     } catch (error) {
       $("datesBox").innerHTML = `<h4>Dates</h4>${errorBox((error as Error).message)}<div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="dates">Try again</button></div>`;
@@ -183,6 +210,9 @@ export function createAuditView(actions: ViewActions): AuditViewController {
   };
 
   const close = (): void => {
+    auditController?.abort();
+    auditController = null;
+    busy = null;
     drawer.classList.add("hidden");
     backdrop.classList.add("hidden");
     drawer.setAttribute("aria-hidden", "true");
@@ -221,9 +251,41 @@ export function createAuditView(actions: ViewActions): AuditViewController {
       void actions.startRun({ onlyNew: true });
       return;
     }
+    if (target.closest("[data-sync-clean-orphans]")) {
+      if (!syncData?.orphanCount) return;
+      const count = syncData.orphanCount;
+      const bytes = syncData.orphanBytes;
+      const sampleList = syncData.orphans
+        .slice(0, 5)
+        .map((o) => `<li class="mono">${escapeHtml(base(o.out))} (${fmt(o.bytes)})</li>`)
+        .join("");
+      void (async () => {
+        const ok = await actions.confirm({
+          title: "Remove orphan output files?",
+          body: `<p class="modal-copy">Remove <strong>${count.toLocaleString()} orphan file(s) (${fmt(bytes)})</strong> from the destination folder that have no matching source file?</p>
+                 <ul class="modal-copy" style="margin:8px 0;padding-left:18px">${sampleList}</ul>
+                 <p class="modal-copy">Your source library is never touched.</p>`,
+          confirmLabel: `Remove ${count.toLocaleString()} orphans`,
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          const res = await api<{ removed: number; bytesFreed: number }>("sync/clean-orphans", {
+            method: "POST",
+            body: {},
+          });
+          actions.toast(`Removed ${res.removed.toLocaleString()} orphan files, freed ${fmt(res.bytesFreed)}.`, "success");
+          void runSync();
+          void actions.refreshPreview();
+        } catch (err) {
+          actions.toast((err as Error).message, "danger");
+        }
+      })();
+      return;
+    }
     const exclude = target.closest<HTMLButtonElement>("[data-exclude-dupes]");
     if (exclude) {
-      const listed = dupeData?.groups.slice(0, 10) ?? [];
+      const listed = dupeData?.groups ?? [];
       const count = listed.reduce((sum, group) => sum + Math.max(0, group.members.length - 1), 0);
       if (!count) return;
       void (async () => {

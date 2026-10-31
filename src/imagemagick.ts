@@ -552,7 +552,7 @@ async function readManagedAppImage(): Promise<ManagedAppImage | null> {
  * fill the AVIF gap; a distro build that can encode AVIF should stay in use.
  */
 function assertNoWorkingSystemMagick(): void {
-  if (process.env.PICMAGIK_FORCE_BUNDLE === "1") return;
+  if (process.env.COMPAKTA_FORCE_BUNDLE === "1" || process.env.PICMAGIK_FORCE_BUNDLE === "1") return;
   let current: MagickInfo | null = null;
   try {
     current = findMagick();

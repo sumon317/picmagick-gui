@@ -5,7 +5,7 @@
  * to the local ImageMagick build. The source tree is never written to.
  */
 import { existsSync } from "node:fs";
-import { readFile, stat } from "node:fs/promises";
+import { readFile, readdir, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -30,7 +30,7 @@ import { verifyOutputs, type VerifyReport } from "./verify.ts";
 import { planBudget, type BudgetPlan } from "./budget.ts";
 import { runHealthCheck, type HealthReport } from "./health.ts";
 import { Job, getJob, liveJob, pausedJob, newJob, manifestsFor, undoManifest } from "./jobs.ts";
-import { analyseSync, pendingOnly, type SyncReport } from "./sync.ts";
+import { analyseSync, cleanOrphans, pendingOnly, type SyncReport } from "./sync.ts";
 import { formatBytes } from "./convert.ts";
 import { checkForUpdate, installLatest, installProgress } from "./imagemagick.ts";
 import {
@@ -42,7 +42,9 @@ import {
 } from "./app-update.ts";
 import { CASE_INSENSITIVE, IS_LINUX, IS_WINDOWS, pathKey, REL_SEP } from "./platform.ts";
 import { PREVIEW_CACHE_DIR, PUBLIC_DIR } from "./appdirs.ts";
+import { loadPersistedSettings, savePersistedSettings } from "./settings.ts";
 import {
+  currentVideoPreview,
   handleVideoApi,
   isVideoJobActive,
   resetVideoScanState,
@@ -82,15 +84,26 @@ type State = {
 };
 
 function defaultSourceRoot(): string {
-  const configured = process.env.PICMAGIK_SOURCE?.trim();
+  const configured =
+    process.env.COMPAKTA_SOURCE?.trim() ||
+    process.env.PICMAGIK_SOURCE?.trim();
   if (configured) return path.resolve(configured);
+  const saved = loadPersistedSettings();
+  if (saved.sourceRoot && existsSync(saved.sourceRoot)) {
+    return path.resolve(saved.sourceRoot);
+  }
   const pictures = path.join(homedir(), "Pictures");
   return existsSync(pictures) ? pictures : homedir();
 }
 
+const savedSettings = loadPersistedSettings();
+
 const DEFAULT_SOURCE = defaultSourceRoot();
 const DEFAULT_DESTINATION =
-  process.env.PICMAGIK_DESTINATION?.trim() || `${DEFAULT_SOURCE}-avif`;
+  process.env.COMPAKTA_DESTINATION?.trim() ||
+  process.env.PICMAGIK_DESTINATION?.trim() ||
+  savedSettings.destination ||
+  `${DEFAULT_SOURCE}-avif`;
 
 function defaultRatios(): Record<OutputFormat, number> {
   return Object.fromEntries(
@@ -104,9 +117,9 @@ const state: State = {
   magick: null,
   scan: null,
   index: new Map(),
-  policy: normalisePolicy(DEFAULT_POLICY),
+  policy: normalisePolicy(savedSettings.policy ?? DEFAULT_POLICY),
   ratios: defaultRatios(),
-  budgetBytes: 10 * 1024 ** 3,
+  budgetBytes: savedSettings.budgetBytes ?? 10 * 1024 ** 3,
   lastPreview: null,
   lastEstimate: null,
   dedupe: null,
@@ -119,6 +132,7 @@ const state: State = {
 const videoBridge: SharedServerBridge = {
   getSourceRoot: () => state.sourceRoot,
   getPhotoDestination: () => state.destination,
+  getPhotoPolicy: () => state.policy,
   getBudgetBytes: () => state.budgetBytes,
   setBudgetBytes: (b: number) => { state.budgetBytes = b; },
   getScan: () => state.scan,
@@ -216,6 +230,99 @@ function cacheKeyFor(file: ScannedFile, prefix: string): string {
   const hasher = new Bun.CryptoHasher("sha256");
   hasher.update(`${file.abs}:${file.mtime}:${file.size}`);
   return `${prefix}_${hasher.digest("hex").slice(0, 16)}.jpg`;
+}
+
+/**
+ * Limits concurrent thumbnail/preview child processes so scrolling a huge
+ * folder never storms the CPU with dozens of ImageMagick instances.
+ */
+function createSemaphore(max: number) {
+  let active = 0;
+  const queue: Array<() => void> = [];
+  const release = () => {
+    active--;
+    const next = queue.shift();
+    if (next) next();
+  };
+  const acquire = (signal?: AbortSignal): Promise<() => void> => {
+    if (signal?.aborted) return Promise.reject(new HttpError(499, "Client closed request"));
+    if (active < max) {
+      active++;
+      return Promise.resolve(release);
+    }
+    return new Promise((resolve, reject) => {
+      const task = () => {
+        signal?.removeEventListener("abort", onAbort);
+        active++;
+        resolve(release);
+      };
+      const onAbort = () => {
+        const idx = queue.indexOf(task);
+        if (idx >= 0) queue.splice(idx, 1);
+        reject(new HttpError(499, "Client closed request"));
+      };
+      signal?.addEventListener("abort", onAbort, { once: true });
+      queue.push(task);
+    });
+  };
+  return { acquire };
+}
+
+const previewSemaphore = createSemaphore(4);
+
+/**
+ * Keep the disposable preview cache bounded across sessions:
+ *   - compare encodes (`cmp-*`, `vcmp-*`) older than 1 hour are deleted
+ *   - every cached preview older than 14 days is deleted
+ *   - if the cache still exceeds 500 MB, evict the oldest files to 400 MB
+ *
+ * Runs in the background at startup; failures are never user-visible because
+ * the cache can always be regenerated.
+ */
+async function prunePreviewCache(cacheDir: string): Promise<void> {
+  if (!existsSync(cacheDir)) return;
+  const now = Date.now();
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+  const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
+  const MAX_CACHE_BYTES = 500 * 1024 * 1024;
+  const TARGET_CACHE_BYTES = 400 * 1024 * 1024;
+
+  try {
+    const entries = await readdir(cacheDir, { withFileTypes: true });
+    const survivors: { full: string; size: number; mtimeMs: number }[] = [];
+    let totalBytes = 0;
+
+    for (const entry of entries) {
+      if (!entry.isFile()) continue;
+      const full = path.join(cacheDir, entry.name);
+      try {
+        const st = await stat(full);
+        const ageMs = now - st.mtimeMs;
+        const isCompareTemp =
+          entry.name.startsWith("cmp-") || entry.name.startsWith("vcmp-");
+
+        if ((isCompareTemp && ageMs > ONE_HOUR_MS) || ageMs > FOURTEEN_DAYS_MS) {
+          await rm(full, { force: true });
+          continue;
+        }
+        survivors.push({ full, size: st.size, mtimeMs: st.mtimeMs });
+        totalBytes += st.size;
+      } catch {
+        /* ignore file race */
+      }
+    }
+
+    if (totalBytes > MAX_CACHE_BYTES) {
+      survivors.sort((a, b) => a.mtimeMs - b.mtimeMs);
+      for (const item of survivors) {
+        if (totalBytes <= TARGET_CACHE_BYTES) break;
+        await rm(item.full, { force: true }).catch(() => {});
+        totalBytes -= item.size;
+      }
+    }
+  } catch {
+    /* ignore background cache cleanup errors */
+  }
 }
 
 function findFileByRel(rel: string | null): ScannedFile | undefined {
@@ -329,6 +436,13 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       resetVideoScanState();
     }
 
+    savePersistedSettings({
+      sourceRoot: state.sourceRoot,
+      destination: state.destination,
+      budgetBytes: state.budgetBytes,
+      policy: state.policy,
+    });
+
     return json({
       ok: true,
       sourceRoot: state.sourceRoot,
@@ -384,6 +498,10 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     // Measured ratios describe the current source. Keep them on a re-scan of
     // the same folder; reset only when the source actually changed.
     if (state.sourceRoot !== previousSource) state.ratios = defaultRatios();
+    savePersistedSettings({
+      sourceRoot: state.sourceRoot,
+      destination: state.destination,
+    });
     return json({
       ok: true,
       durationMs: Date.now() - t0,
@@ -402,6 +520,11 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     applyPolicyUpdate(body.policy);
     const preview = currentPreview();
     const budget: BudgetPlan = planBudget(preview, state.budgetBytes);
+    // A single scan covers photos and videos. Show the video projection too so
+    // the budget meter reflects the whole library, not just the active tab.
+    const videoPreview = state.scan ? currentVideoPreview(state.scan) : null;
+    const otherModeBytes = videoPreview?.estOutputBytes ?? 0;
+    const otherModeCount = videoPreview?.estOutputFiles ?? 0;
     const health = await runHealthCheck(
       state.sourceRoot,
       state.destination,
@@ -420,6 +543,8 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       formatLabel: FORMAT_SPECS[state.policy.outputFormat].label,
       byFolder: preview.byFolder,
       budget,
+      otherModeBytes,
+      otherModeCount,
       health,
       // health already measured free space for the destination.
       freeBytes: health.freeBytes,
@@ -452,9 +577,13 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   // ---- duplicates ----
   if (route === "duplicates" && req.method === "POST") {
     if (!state.scan) throw new HttpError(400, "Scan the library first.");
-    const body = await readBody<{ maxHash?: number }>(req);
+    const body = await readBody<{ maxHash?: number; policy?: Partial<Policy> }>(req);
+    if (body.policy) {
+      state.policy = normalisePolicy({ ...state.policy, ...body.policy });
+    }
     const res = await findDuplicates(state.scan.files, state.policy, {
       maxHash: Math.min(body.maxHash ?? 6000, 40000),
+      signal: req.signal,
     });
     state.dedupe = res;
     return json({
@@ -470,7 +599,10 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   // ---- metadata / dates ----
   if (route === "dates" && req.method === "POST") {
     if (!state.scan) throw new HttpError(400, "Scan the library first.");
-    const body = await readBody<{ limit?: number }>(req);
+    const body = await readBody<{ limit?: number; policy?: Partial<Policy> }>(req);
+    if (body.policy) {
+      state.policy = normalisePolicy({ ...state.policy, ...body.policy });
+    }
     const preview = currentPreview();
     const magick = requireMagick();
     const all = [...preview.convert, ...preview.copy];
@@ -478,7 +610,7 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const limit = Math.max(1, Math.min(body.limit ?? 4000, 20000));
     const subset = all.slice(0, limit);
     const facts: ImageFacts[] = await identifyMany(
-      magick.path, subset.map((d) => d.file.abs), 8,
+      magick.path, subset.map((d) => d.file.abs), 8, req.signal,
     );
     const report = buildDateReport(facts);
     state.dates = report;
@@ -666,7 +798,11 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       await new Promise<void>((resolve) => {
         const c = spawn(magick.path, buildEncoderArgs({
           srcArg, out, format, quality: q, speed,
-        }), { windowsHide: true, env: { ...process.env, MAGICK_THREAD_LIMIT: "1" } });
+        }), {
+          windowsHide: true,
+          stdio: "ignore",
+          env: { ...process.env, MAGICK_THREAD_LIMIT: "1" },
+        });
         c.on("close", () => resolve());
         c.on("error", () => resolve());
       });
@@ -738,54 +874,72 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const thumbName = cacheKeyFor(file, "thumb");
     const thumbPath = path.join(previewCacheDir, thumbName);
 
-    if (!existsSync(thumbPath)) {
-      if (file.category === "video") {
-        const ffmpeg = findFfmpeg();
+    if (file.category === "video") {
+      const pngPath = thumbPath.replace(/\.jpg$/, ".png");
+      if (!existsSync(pngPath)) {
+        let ffmpeg = null;
+        try { ffmpeg = findFfmpeg(); } catch { ffmpeg = null; }
         if (ffmpeg) {
-          const pngPath = thumbPath.replace(/\.jpg$/, ".png");
-          if (!existsSync(pngPath)) {
-            await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, pngPath);
-          }
-          if (existsSync(pngPath)) {
-            const data = await readFile(pngPath);
-            return new Response(data, {
-              headers: {
-                "content-type": "image/png",
-                "cache-control": "public, max-age=86400",
-              },
+          await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, pngPath);
+        }
+      }
+      if (existsSync(pngPath)) {
+        const data = await readFile(pngPath);
+        return new Response(data, {
+          headers: {
+            "content-type": "image/png",
+            "cache-control": "public, max-age=86400",
+          },
+        });
+      }
+      throw new HttpError(404, "No video thumbnail available");
+    }
+
+    if (!existsSync(thumbPath)) {
+      // Photos (image or raw)
+      let magick: MagickInfo | null = state.magick;
+      if (!magick) {
+        try { magick = findMagick(); } catch { magick = null; }
+      }
+      if (magick) {
+        const release = await previewSemaphore.acquire(req.signal);
+        try {
+          if (!existsSync(thumbPath)) {
+            await new Promise<void>((resolve, reject) => {
+              const child = spawn(magick.path, [
+                `${file.abs}[0]`,
+                "-auto-orient",
+                "-thumbnail", "96x96^",
+                "-gravity", "center",
+                "-extent", "96x96",
+                "-quality", "80",
+                thumbPath,
+              ], { windowsHide: true, stdio: "ignore" });
+              const onAbort = () => {
+                try { child.kill(); } catch { /* already gone */ }
+                reject(new HttpError(499, "Cancelled"));
+              };
+              req.signal.addEventListener("abort", onAbort, { once: true });
+              const timer = setTimeout(() => {
+                try { child.kill(); } catch { /* already gone */ }
+                reject(new Error("Thumbnail generation timed out"));
+              }, 8000);
+              child.on("close", (code) => {
+                clearTimeout(timer);
+                req.signal.removeEventListener("abort", onAbort);
+                if (code === 0) resolve();
+                else reject(new Error(`Thumbnail generation failed with code ${code}`));
+              });
+              child.on("error", (err) => {
+                clearTimeout(timer);
+                req.signal.removeEventListener("abort", onAbort);
+                reject(err);
+              });
             });
           }
+        } finally {
+          release();
         }
-        throw new HttpError(404, "No video thumbnail available");
-      }
-
-      // Photos (image or raw)
-      const magick = state.magick ?? findMagick();
-      if (magick) {
-        await new Promise<void>((resolve, reject) => {
-          const child = spawn(magick.path, [
-            `${file.abs}[0]`,
-            "-auto-orient",
-            "-thumbnail", "96x96^",
-            "-gravity", "center",
-            "-extent", "96x96",
-            "-quality", "80",
-            thumbPath,
-          ]);
-          const timer = setTimeout(() => {
-            child.kill();
-            reject(new Error("Thumbnail generation timed out"));
-          }, 8000);
-          child.on("close", (code) => {
-            clearTimeout(timer);
-            if (code === 0) resolve();
-            else reject(new Error(`Thumbnail generation failed with code ${code}`));
-          });
-          child.on("error", (err) => {
-            clearTimeout(timer);
-            reject(err);
-          });
-        });
       } else if (IMAGE_MIME[file.ext.toLowerCase()]) {
         const data = await readFile(file.abs);
         return new Response(data, {
@@ -828,7 +982,8 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     }
 
     if (file.category === "video") {
-      const ffmpeg = findFfmpeg();
+      let ffmpeg = null;
+      try { ffmpeg = findFfmpeg(); } catch { ffmpeg = null; }
       if (ffmpeg) {
         const framePath = path.join(previewCacheDir, cacheKeyFor(file, "frame").replace(/\.jpg$/, ".png"));
         if (!existsSync(framePath)) {
@@ -854,32 +1009,56 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const viewPath = path.join(previewCacheDir, viewName);
 
     if (!existsSync(viewPath)) {
-      const magick = state.magick ?? findMagick();
+      let magick: MagickInfo | null = state.magick;
       if (!magick) {
+        try { magick = findMagick(); } catch { magick = null; }
+      }
+      if (!magick) {
+        if (IMAGE_MIME[ext]) {
+          const data = await readFile(file.abs);
+          return new Response(data, {
+            headers: {
+              "content-type": IMAGE_MIME[ext],
+              "cache-control": "no-store",
+            },
+          });
+        }
         throw new HttpError(500, "ImageMagick required to preview this image");
       }
-      await new Promise<void>((resolve, reject) => {
-        const child = spawn(magick.path, [
-          `${file.abs}[0]`,
-          "-auto-orient",
-          "-resize", "2048x2048>",
-          "-quality", "85",
-          viewPath,
-        ]);
-        const timer = setTimeout(() => {
-          child.kill();
-          reject(new Error("Preview generation timed out"));
-        }, 15000);
-        child.on("close", (code) => {
-          clearTimeout(timer);
-          if (code === 0) resolve();
-          else reject(new Error(`Preview generation failed with code ${code}`));
+      const release = await previewSemaphore.acquire(req.signal);
+      try {
+        await new Promise<void>((resolve, reject) => {
+          const child = spawn(magick.path, [
+            `${file.abs}[0]`,
+            "-auto-orient",
+            "-resize", "2048x2048>",
+            "-quality", "85",
+            viewPath,
+          ], { windowsHide: true, stdio: "ignore" });
+          const onAbort = () => {
+            try { child.kill(); } catch { /* already gone */ }
+            reject(new HttpError(499, "Cancelled"));
+          };
+          req.signal.addEventListener("abort", onAbort, { once: true });
+          const timer = setTimeout(() => {
+            try { child.kill(); } catch { /* already gone */ }
+            reject(new Error("Preview generation timed out"));
+          }, 15000);
+          child.on("close", (code) => {
+            clearTimeout(timer);
+            req.signal.removeEventListener("abort", onAbort);
+            if (code === 0) resolve();
+            else reject(new Error(`Preview generation failed with code ${code}`));
+          });
+          child.on("error", (err) => {
+            clearTimeout(timer);
+            req.signal.removeEventListener("abort", onAbort);
+            reject(err);
+          });
         });
-        child.on("error", (err) => {
-          clearTimeout(timer);
-          reject(err);
-        });
-      });
+      } finally {
+        release();
+      }
     }
 
     const data = await readFile(viewPath);
@@ -1063,7 +1242,7 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       upToDateCount: report.upToDateCount,
       pendingCount: report.pendingCount,
       pendingSourceBytes: report.pendingSourceBytes,
-      orphanCount: report.orphans.length,
+      orphanCount: report.orphanCount,
       orphanBytes: report.orphanBytes,
       orphans: report.orphans.slice(0, 25),
       estOutputBytes: Math.round(
@@ -1077,6 +1256,17 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       changed: report.entries.filter((e) => e.state === "changed").slice(0, 50),
       sampleNew: report.entries.filter((e) => e.state === "new").slice(0, 25),
     });
+  }
+
+  // ---- opt-in orphan cleanup ----
+  if (route === "sync/clean-orphans" && req.method === "POST") {
+    if (!state.scan) throw new HttpError(400, "Scan the library first.");
+    const preview = currentPreview();
+    const decisions = [...preview.convert, ...preview.copy];
+    const report = await analyseSync(decisions, state.sourceRoot, state.destination, state.policy);
+    const result = await cleanOrphans(state.destination, report.orphans);
+    state.sync = null;
+    return json(result);
   }
 
   // ---- verify the outputs of a finished run ----
@@ -1331,6 +1521,17 @@ export function startServer(options: ServerOptions = {}): RunningServer {
     idleTimeout: 255,
 
     async fetch(req) {
+      // Reject DNS-rebinding and cross-origin requests to the unauthenticated
+      // localhost API. The Host header must point at loopback, and any Origin
+      // that is present must be loopback too.
+      const host = req.headers.get("host") ?? "";
+      if (host && !/^(127\.0\.0\.1|localhost)(:\d+)?$/i.test(host)) {
+        return new Response("Forbidden host", { status: 403 });
+      }
+      const origin = req.headers.get("origin");
+      if (origin && !/^https?:\/\/(127\.0\.0\.1|localhost)(:\d+)?$/i.test(origin)) {
+        return new Response("Forbidden origin", { status: 403 });
+      }
       const url = new URL(req.url);
       try {
         if (url.pathname.startsWith("/api/")) {
@@ -1369,6 +1570,8 @@ export function startServer(options: ServerOptions = {}): RunningServer {
     openBrowser(`http://127.0.0.1:${boundPort}`);
   }
 
+  void prunePreviewCache(previewCacheDir);
+
   return { server, port: boundPort, stop: () => server.stop(true) };
 }
 
@@ -1385,6 +1588,6 @@ function openBrowser(target: string): void {
 }
 
 // The desktop main process imports this module and starts the server itself.
-if (import.meta.main && !process.env.PICMAGIK_DESKTOP) {
+if (import.meta.main && !process.env.COMPAKTA_DESKTOP && !process.env.PICMAGIK_DESKTOP) {
   startServer();
 }

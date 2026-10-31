@@ -72,7 +72,9 @@ export async function analyseVideoSync(
             }
             matchedOut = candidate;
             outBytes = st.size;
-            if (st.mtimeMs < d.file.mtime) {
+            // Filesystem timestamp precision varies across NTFS/ext4/exFAT, so
+            // allow a one-second rounding window before calling an output stale.
+            if (st.mtimeMs + 1000 < d.file.mtime) {
               stale = true;
               reason = "output older than source";
             } else {
@@ -148,6 +150,7 @@ export async function analyseVideoSync(
     upToDateCount: entries.filter((e) => e.state === "upToDate").length,
     pendingCount: pending.length,
     pendingSourceBytes: pending.reduce((a, e) => a + e.sourceBytes, 0),
+    orphanCount: orphans.length,
     orphans: orphans.sort((a, b) => b.bytes - a.bytes).slice(0, 200),
     orphanBytes,
     entries,

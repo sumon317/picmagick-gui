@@ -1,0 +1,28 @@
+#!/bin/sh
+# Pre-commit secret scan via Betterleaks.
+#
+# Installed with:  git config core.hooksPath .githooks
+# Emergency bypass: git commit --no-verify
+#
+# Scans only what is staged, so it is fast regardless of repo size.
+# Exit 1 blocks the commit. Exit 0 allows it.
+
+BETTERLEAKS_BIN="${BETTERLEAKS_BIN:-/c/es/apps/betterleaks_1.9.0_windows_x64/betterleaks.exe}"
+
+if [ ! -f "$BETTERLEAKS_BIN" ]; then
+  if command -v betterleaks >/dev/null 2>&1; then
+    BETTERLEAKS_BIN=betterleaks
+  else
+    printf '%s\n' \
+      "pre-commit: betterleaks not found." \
+      "  Looked for: $BETTERLEAKS_BIN" \
+      "  Install it, set BETTERLEAKS_BIN, or bypass with: git commit --no-verify" >&2
+    exit 1
+  fi
+fi
+
+# Prefer a repo-owned config when one is present (it is never auto-loaded).
+set -- git --pre-commit --staged --redact --no-banner --no-color -v
+[ -f .betterleaks.toml ] && set -- "$@" -c .betterleaks.toml
+
+exec "$BETTERLEAKS_BIN" "$@"

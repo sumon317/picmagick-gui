@@ -3,7 +3,16 @@
  * testing hardware encoder initialization, and managing automated downloads.
  */
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, existsSync, readdirSync, rmSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  readdirSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { mkdir } from "node:fs/promises";
 import path from "node:path";
 
@@ -35,6 +44,8 @@ const FFPROBE_BIN = IS_WINDOWS ? "ffprobe.exe" : "ffprobe";
 
 let cachedFfmpeg: FfmpegInfo | null = null;
 
+const CAP_CACHE_FILE = path.join(FFMPEG_DIR, ".capabilities-cache.json");
+
 export function isTrustedFfmpegUrl(url: string): boolean {
   try {
     const parsed = new URL(url);
@@ -48,10 +59,25 @@ export function isTrustedFfmpegUrl(url: string): boolean {
   }
 }
 
-function probeEncoders(ffmpegPath: string): {
+function probeEncoders(ffmpegPath: string, version: string): {
   formats: Record<VideoOutputFormat, FormatSupport>;
   hwEncoders: FfmpegHwEncoders;
 } {
+  let cacheKey = `${ffmpegPath}:${version}`;
+  try {
+    if (path.isAbsolute(ffmpegPath) && existsSync(ffmpegPath)) {
+      cacheKey += `:${statSync(ffmpegPath).mtimeMs}`;
+    }
+    if (existsSync(CAP_CACHE_FILE)) {
+      const cached = JSON.parse(readFileSync(CAP_CACHE_FILE, "utf8"));
+      if (cached?.key === cacheKey && cached.formats && cached.hwEncoders) {
+        return { formats: cached.formats, hwEncoders: cached.hwEncoders };
+      }
+    }
+  } catch {
+    /* ignore cache read error */
+  }
+
   const formats: Record<VideoOutputFormat, FormatSupport> = {
     av1: { mode: "ro", writable: false, detail: "libsvtav1 missing" },
     hevc: { mode: "ro", writable: false, detail: "libx265 missing" },
@@ -109,6 +135,13 @@ function probeEncoders(ffmpegPath: string): {
       formats.hevc_hw = { mode: "rw+", writable: true, detail: candidate };
       break;
     }
+  }
+
+  try {
+    mkdirSync(FFMPEG_DIR, { recursive: true });
+    writeFileSync(CAP_CACHE_FILE, JSON.stringify({ key: cacheKey, formats, hwEncoders }), "utf8");
+  } catch {
+    /* ignore cache write error */
   }
 
   return { formats, hwEncoders };
@@ -186,7 +219,7 @@ export function findFfmpeg(forceRefresh = false): FfmpegInfo {
     const pPath = path.join(dir, FFPROBE_BIN);
     if (existsSync(fPath) && existsSync(pPath)) {
       const version = parseFfmpegVersion(fPath);
-      const { formats, hwEncoders } = probeEncoders(fPath);
+      const { formats, hwEncoders } = probeEncoders(fPath, version);
       cachedFfmpeg = {
         ffmpegPath: fPath,
         ffprobePath: pPath,
@@ -205,7 +238,7 @@ export function findFfmpeg(forceRefresh = false): FfmpegInfo {
     if (version !== "unknown") {
       // Verify ffprobe also exists
       execFileSync(FFPROBE_BIN, ["-version"], { stdio: "ignore", windowsHide: true, timeout: 3000 });
-      const { formats, hwEncoders } = probeEncoders(FFMPEG_BIN);
+      const { formats, hwEncoders } = probeEncoders(FFMPEG_BIN, version);
       cachedFfmpeg = {
         ffmpegPath: FFMPEG_BIN,
         ffprobePath: FFPROBE_BIN,

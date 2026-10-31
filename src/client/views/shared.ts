@@ -14,6 +14,7 @@ import type {
   ScannedFile,
   UpdateStatus,
   VerifyResponse,
+  VideoPolicy,
 } from "../types";
 
 export type ConfirmOptions = {
@@ -28,7 +29,7 @@ export type ViewActions = {
   switchView: (view: "workspace" | "run" | "compare" | "runs" | "health") => void;
   refreshPreview: () => Promise<void>;
   refreshTree: () => void;
-  policy: () => Policy;
+  policy: () => Policy | VideoPolicy;
   toast: (
     message: string,
     kind?: ToastKind,
@@ -38,9 +39,9 @@ export type ViewActions = {
   startRun: (opts?: { onlyNew?: boolean }) => Promise<void>;
   undoManifest: (id: string, summary?: ManifestSummary) => Promise<void>;
   verifyJob: (jobId: string) => Promise<VerifyResponse>;
-  runCompare: (rel: string, format?: OutputFormat) => Promise<CompareResponse>;
+  runCompare: (rel: string, format?: OutputFormat, timestampSec?: number) => Promise<CompareResponse>;
   selectedFiles: () => ScannedFile[];
-  setQuality: (quality: number) => void;
+  setQuality: (quality: number, format?: OutputFormat) => void;
   checkMagick: (force?: boolean) => Promise<UpdateStatus>;
   refreshStatusMagick: () => Promise<void>;
   installMagick: () => Promise<void>;

@@ -22,7 +22,7 @@ import type { VideoDecision, VideoPolicy } from "./policy.ts";
 
 function runFfmpegSlice(exe: string, args: string[]): Promise<number> {
   return new Promise((resolve) => {
-    const c = spawn(exe, args, { windowsHide: true });
+    const c = spawn(exe, args, { windowsHide: true, stdio: "ignore" });
     if (c.pid) applyProcessCpuLimit(c.pid, 70);
     c.on("error", () => resolve(-1));
     c.on("close", (code) => resolve(code ?? -1));
@@ -99,39 +99,65 @@ export async function estimateVideoFromSample(opts: {
       const ext = opts.policy.outputFormat === "vp9" ? "webm" : opts.policy.container;
       const outSlice = path.join(scratch, `sample-${i}.${ext}`);
 
-      const args = buildVideoEncoderArgs({
-        src: d.file.abs,
-        out: outSlice,
-        format: opts.policy.outputFormat,
-        container: opts.policy.container,
-        quality: opts.policy.quality,
-        speed: opts.policy.speed,
-        maxResolution: opts.policy.maxResolution,
-        maxFps: opts.policy.maxFps,
-        audioMode: opts.policy.audioMode,
-        sourceAudioCodec: facts.audioCodec,
-        sourceFps: facts.fps,
-        isHdr: facts.isHdr,
-        colorTransfer: facts.colorTransfer,
-        tenBit: opts.policy.tenBit,
-        filmGrain: opts.policy.filmGrain,
-        customParams: opts.policy.customParams,
-        hwEncoderName,
-        sliceStartSec: sliceStart,
-        sliceDurationSec: sliceDur,
-      });
+      const buildSliceArgs = (startSec: number) =>
+        buildVideoEncoderArgs({
+          src: d.file.abs,
+          out: outSlice,
+          format: opts.policy.outputFormat,
+          container: opts.policy.container,
+          quality: opts.policy.quality,
+          speed: opts.policy.speed,
+          maxResolution: opts.policy.maxResolution,
+          maxFps: opts.policy.maxFps,
+          audioMode: opts.policy.audioMode,
+          sourceAudioCodec: facts.audioCodec,
+          sourceFps: facts.fps,
+          isHdr: facts.isHdr,
+          colorTransfer: facts.colorTransfer,
+          tenBit: opts.policy.tenBit,
+          filmGrain: opts.policy.filmGrain,
+          customParams: opts.policy.customParams,
+          hwEncoderName,
+          sliceStartSec: startSec,
+          sliceDurationSec: sliceDur,
+        });
 
-      const t0 = Date.now();
-      const code = await runFfmpegSlice(opts.ffmpeg.ffmpegPath, args);
-      const elapsedMs = Date.now() - t0;
-      if (code !== 0) continue;
+      let t0 = Date.now();
+      let code = await runFfmpegSlice(opts.ffmpeg.ffmpegPath, buildSliceArgs(sliceStart));
+      let elapsedMs = Date.now() - t0;
+
+      let sliceBytes = 0;
+      if (code === 0) {
+        try {
+          sliceBytes = (await stat(outSlice)).size;
+        } catch {
+          sliceBytes = 0;
+        }
+      }
+
+      // Fast seeking lands on the previous keyframe. On long-GOP screen
+      // recordings the only keyframe can be at 0s, so a 40% seek jumps past
+      // EOF and leaves a tiny header. Retry from the start before giving up.
+      if (sliceBytes < 1024 && sliceStart > 0) {
+        await rm(outSlice, { force: true }).catch(() => {});
+        t0 = Date.now();
+        code = await runFfmpegSlice(opts.ffmpeg.ffmpegPath, buildSliceArgs(0));
+        elapsedMs = Date.now() - t0;
+        if (code === 0) {
+          try {
+            sliceBytes = (await stat(outSlice)).size;
+          } catch {
+            sliceBytes = 0;
+          }
+        }
+      }
+
+      if (code !== 0 || sliceBytes === 0) continue;
 
       try {
-        const st = await stat(outSlice);
-        if (st.size === 0) continue;
         const sliceFraction = sliceDur / dur;
         sampledSourceEquivalentBytes += Math.round(d.file.size * sliceFraction);
-        producedSliceBytes += st.size;
+        producedSliceBytes += sliceBytes;
         totalSampleDurationSec += dur;
         encodedSliceDurationSec += sliceDur;
         encodeWallMs += elapsedMs;

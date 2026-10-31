@@ -14,7 +14,7 @@ import path from "node:path";
 
 import { CASE_INSENSITIVE, REL_SEP } from "./platform.ts";
 import {
-  DEFAULT_POLICY, normalisePolicy, outputPathFor, type Decision, type Policy,
+  DEFAULT_POLICY, applyPolicy, normalisePolicy, outputPathFor, type Decision, type Policy,
 } from "./policy.ts";
 import {
   DEFAULT_FORMAT, FORMAT_SPECS, OUTPUT_FORMATS, buildEncoderArgs, jp2Rate,
@@ -25,6 +25,7 @@ import { parseFormatSupport } from "./paths.ts";
 import { manifestPath, readManifest, writeManifest } from "./manifest.ts";
 import { analyseSync } from "./sync.ts";
 import type { ScannedFile } from "./scan.ts";
+import type { ScanResult } from "./scan.ts";
 import * as destination from "../src/client/format-logic.ts";
 
 let failures = 0;
@@ -146,6 +147,19 @@ await check("AVIF output paths keep the existing naming", () => {
     ),
     path.join(destinationRoot, nativeRel("album", "sub"), "a-q80.avif"),
   );
+});
+
+await check("same-stem siblings get distinct output paths", () => {
+  const files = [
+    scanned(["album", "IMG_001.JPG"], 2 * 1024 * 1024, "jpg"),
+    scanned(["album", "IMG_001.HEIC"], 2 * 1024 * 1024, "heic"),
+  ];
+  const policy = withPolicy({ outputFormat: "avif" });
+  const preview = applyPolicy({ files } as ScanResult, policy);
+  const outs = preview.convert
+    .map((d) => path.basename(outputPathFor(d, "/library", path.resolve("/out"), policy)))
+    .sort();
+  assert.deepEqual(outs, ["IMG_001-heic.avif", "IMG_001-jpg.avif"]);
 });
 
 await check("AVIF source arguments preserve the existing GIF rule", () => {

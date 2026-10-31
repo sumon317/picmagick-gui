@@ -20,7 +20,7 @@ export type FormatUi = {
   apply: (id: OutputFormat, restore: boolean) => void;
   lock: (on: boolean) => void;
   refreshCards: () => void;
-  setQuality: (quality: number) => void;
+  setQuality: (quality: number, format?: OutputFormat) => void;
   qualityText: (spec: FormatSpec, quality: number) => string;
   current: () => OutputFormat;
 };
@@ -181,10 +181,18 @@ export function createFormatUi(options: FormatUiOptions): FormatUi {
     apply(chosen, true);
   };
 
-  const setQuality = (quality: number): void => {
-    const spec = state.formatSpecs[state.currentFormat];
+  const setQuality = (quality: number, format?: OutputFormat): void => {
+    const target = format ?? state.currentFormat;
+    const spec = state.formatSpecs[target];
     if (!spec) return;
     const next = Math.min(spec.quality.max, Math.max(spec.quality.min, quality));
+    if (target !== state.currentFormat) {
+      state.formatMemory[target] = {
+        quality: next,
+        speed: state.formatMemory[target]?.speed ?? spec.speed.default,
+      };
+      return;
+    }
     const inputNode = input("quality");
     inputNode.value = String(next);
     paint(inputNode);

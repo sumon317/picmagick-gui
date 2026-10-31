@@ -214,6 +214,25 @@ await check("Mode 3 (custom): mirrors the folder structure in a separate locatio
   assert.equal(defaultCustom, `${srcRoot}-av1`);
 });
 
+await check("same-stem videos get distinct output paths", () => {
+  const srcRoot = path.resolve("/dcim");
+  const dest = path.resolve("/dcim-avif");
+  const policy = withVideoPolicy({ minSizeBytes: 0, destMode: "merge", container: "mp4" });
+  const preview = applyVideoPolicy(
+    {
+      files: [
+        scannedVideo(["reel", "CLIP.MOV"], 50 * 1024 * 1024, "mov"),
+        scannedVideo(["reel", "CLIP.MP4"], 50 * 1024 * 1024, "mp4"),
+      ],
+    } as ScanResult,
+    policy,
+  );
+  const outs = preview.convert
+    .map((d) => path.basename(videoOutputPathFor(d, srcRoot, dest, policy)))
+    .sort();
+  assert.deepEqual(outs, ["CLIP-mov.mp4", "CLIP-mp4.mp4"]);
+});
+
 await check("copied videos keep their original filename and extension in all modes", () => {
   const srcRoot = path.resolve("/dcim");
   const photoDest = path.resolve("/dcim-avif");
@@ -279,7 +298,9 @@ await check("tinkerer overrides: 1080p cap, 30fps cap, film grain, Opus audio, M
 
   assert.equal(args.includes("-vf"), true);
   const vfArg = args[args.indexOf("-vf") + 1];
-  assert.equal(vfArg.includes("min(1920,iw)"), true);
+  // maxResolution is a short-edge cap: landscape caps height, portrait caps width.
+  assert.equal(vfArg.includes("if(gt(iw,ih),-2,min(1080,iw))"), true);
+  assert.equal(vfArg.includes("if(gt(iw,ih),min(1080,ih),-2)"), true);
   assert.equal(vfArg.includes("fps=30"), true);
 
   assert.equal(args[args.indexOf("-crf") + 1], "36");

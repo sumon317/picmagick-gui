@@ -5,7 +5,7 @@
  * written to. Every write goes through outputPathFor() into the destination.
  */
 import { spawn } from "node:child_process";
-import { copyFile, mkdir, stat, rm } from "node:fs/promises";
+import { copyFile, mkdir, rename, stat, rm, utimes } from "node:fs/promises";
 import path from "node:path";
 import type { Decision } from "./policy.ts";
 import { outputPathFor, type Policy } from "./policy.ts";
@@ -65,6 +65,9 @@ function runMagick(
   return new Promise((resolve) => {
     const child = spawn(exe, args, {
       windowsHide: true,
+      // On Linux, make the encoder a process-group leader so cancelling an
+      // AppImage wrapper also terminates the inner magick it forked.
+      detached: process.platform === "linux",
       env: {
         ...process.env,
         MAGICK_THREAD_LIMIT: "1",
@@ -83,6 +86,14 @@ function runMagick(
     });
 
     const onAbort = () => {
+      if (process.platform === "linux" && child.pid) {
+        try {
+          process.kill(-child.pid, "SIGKILL");
+          return;
+        } catch {
+          /* not a group leader */
+        }
+      }
       try { child.kill(); } catch { /* already gone */ }
     };
     signal.addEventListener("abort", onAbort, { once: true });
@@ -104,22 +115,19 @@ function runMagick(
 }
 
 /**
- * Delete a zero-byte output. An encode can be killed after ImageMagick opens
- * the destination but before it writes any pixels, leaving a file that the
- * skip-existing check would otherwise treat as a finished conversion.
+ * Temporary sibling used for atomic output. The final rename is atomic on the
+ * same volume, so a killed encode can never leave a truncated file that the
+ * skip-existing check would treat as a finished conversion.
  */
-async function removeEmptyOutput(out: string): Promise<void> {
-  try {
-    const st = await stat(out);
-    if (st.size === 0) await rm(out, { force: true });
-  } catch { /* no output */ }
+function partPathFor(finalOut: string): string {
+  const ext = path.extname(finalOut);
+  const base = finalOut.slice(0, finalOut.length - ext.length);
+  return `${base}.part-${process.pid}${ext}`;
 }
 
 async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
   const started = Date.now();
   const src = d.file.abs;
-  // Where this file's output would land, so a killed encode can be cleaned up.
-  const expectedOut = outputPathFor(d, o.sourceRoot, o.destination, o.policy);
 
   // Tell the UI this file is now in flight. A single AV1 encode can run for
   // many seconds, and without this the progress bar sits at zero with no
@@ -138,6 +146,8 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
 
   if (o.signal.aborted) return { ...base, status: "cancelled", seconds: 0 };
 
+  let activePart: string | null = null;
+
   try {
     if (d.verdict === "copy") {
       const out = outputPathFor(d, o.sourceRoot, o.destination, o.policy);
@@ -145,16 +155,28 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
         return { ...base, out, status: "skipped", seconds: (Date.now() - started) / 1000 };
       }
       await mkdir(path.dirname(out), { recursive: true });
-      await copyFile(src, out);
-      const st = await stat(out);
+      activePart = partPathFor(out);
+      await copyFile(src, activePart);
+      if (o.signal.aborted) {
+        await rm(activePart, { force: true }).catch(() => {});
+        activePart = null;
+        return { ...base, status: "cancelled", seconds: (Date.now() - started) / 1000 };
+      }
+      const st = await stat(activePart);
+      await rename(activePart, out);
+      activePart = null;
+      const mtimeDate = new Date(d.file.mtime);
+      await utimes(out, mtimeDate, mtimeDate).catch(() => {});
       return {
-        ...base, out, status: "copied",
-        seconds: (Date.now() - started) / 1000, outBytes: st.size,
+        ...base,
+        out,
+        status: "copied",
+        seconds: (Date.now() - started) / 1000,
+        outBytes: st.size,
       };
     }
 
     // ---- convert ----
-    const multi = o.policy.qualities.length > 1;
     let totalOut = 0;
     let anyWritten = false;
     let primaryOut: string | null = null;
@@ -162,10 +184,12 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
 
     for (const q of o.policy.qualities) {
       const out = outputPathFor(d, o.sourceRoot, o.destination, o.policy, q);
-
       if (!(await overwriteOk(out, o.overwrite))) continue;
 
       await mkdir(path.dirname(out), { recursive: true });
+      const partOut = partPathFor(out);
+      activePart = partOut;
+      await rm(partOut, { force: true }).catch(() => {});
 
       // Multi-frame sources become animated JXL/AVIF/WebP as-is. HEIC,
       // JPEG 2000, JPEG, and PNG select frame 0. flattenGif still selects
@@ -179,10 +203,12 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
 
       const args = buildEncoderArgs({
         srcArg,
-        out,
+        out: partOut,
         format: o.policy.outputFormat,
         quality: q,
         speed: o.policy.heicSpeed,
+        maxResolution: o.policy.maxResolution,
+        stripMetadata: o.policy.stripMetadata,
       });
 
       const cpuLimit = o.getCpuLimit ? o.getCpuLimit() : (o.cpuLimit ?? 70);
@@ -198,6 +224,8 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
       // A user cancel also ends the child with a signal; don't misreport it as
       // an encoder crash or an out-of-memory kill.
       if (o.signal.aborted) {
+        await rm(partOut, { force: true }).catch(() => {});
+        activePart = null;
         return { ...base, status: "cancelled", seconds: (Date.now() - started) / 1000 };
       }
 
@@ -206,23 +234,61 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
         lastErr = detail || (signal
           ? `encoder was killed by ${signal} (likely out of memory)`
           : `encoder exited with code ${code}`);
-        await removeEmptyOutput(out);
+        await rm(partOut, { force: true }).catch(() => {});
+        activePart = null;
         continue;
       }
 
       try {
-        const st = await stat(out);
+        const st = await stat(partOut);
         // aom exits 0 and writes a zero-byte file at heic:speed 10, so exit
         // code alone is not proof of success.
         if (st.size === 0) {
           lastErr = lastErr || "encoder wrote an empty file";
-          await removeEmptyOutput(out);
+          await rm(partOut, { force: true }).catch(() => {});
+          activePart = null;
           continue;
         }
+
+        // Smaller-Only Guard: never inflate a single-quality photo. If the
+        // encode is at least as large as the source, keep the original bytes
+        // (with their original extension) instead.
+        if (
+          o.policy.skipAlreadyEfficient !== false &&
+          o.policy.qualities.length === 1 &&
+          st.size >= d.file.size
+        ) {
+          await rm(partOut, { force: true }).catch(() => {});
+          activePart = null;
+          const copyDecision: Decision = { ...d, verdict: "copy", reason: "undersized" };
+          const copyOut = outputPathFor(copyDecision, o.sourceRoot, o.destination, o.policy);
+          if (!(await overwriteOk(copyOut, o.overwrite))) {
+            return { ...base, out: copyOut, status: "skipped", seconds: (Date.now() - started) / 1000 };
+          }
+          await mkdir(path.dirname(copyOut), { recursive: true });
+          await copyFile(src, copyOut);
+          const mtimeDate = new Date(d.file.mtime);
+          await utimes(copyOut, mtimeDate, mtimeDate).catch(() => {});
+          const origSt = await stat(copyOut);
+          return {
+            ...base,
+            out: copyOut,
+            status: "copied",
+            seconds: (Date.now() - started) / 1000,
+            outBytes: origSt.size,
+          };
+        }
+
+        await rename(partOut, out);
+        activePart = null;
+        const mtimeDate = new Date(d.file.mtime);
+        await utimes(out, mtimeDate, mtimeDate).catch(() => {});
         totalOut += st.size;
         anyWritten = true;
         if (!primaryOut) primaryOut = out;
       } catch {
+        await rm(partOut, { force: true }).catch(() => {});
+        activePart = null;
         lastErr = "encoder reported success but produced no file";
       }
     }
@@ -251,20 +317,8 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
       error: (err as Error).message,
     };
   } finally {
-    // If we were killed mid-encode, a truncated output may be sitting on disk.
-    // Left alone, the skip-existing check would treat that as finished forever,
-    // so a later resume would silently skip the file.
-    if (o.signal.aborted && d.verdict === "convert") {
-      for (const q of o.policy.qualities) {
-        const partial = outputPathFor(d, o.sourceRoot, o.destination, o.policy, q);
-        try {
-          const st = await stat(partial);
-          // Only remove it if this run did not already finish writing it.
-          if (st.size === 0 || (base.outBytes === 0 && partial !== base.out)) {
-            await rm(partial, { force: true });
-          }
-        } catch { /* nothing there */ }
-      }
+    if (activePart) {
+      await rm(activePart, { force: true }).catch(() => {});
     }
   }
 }

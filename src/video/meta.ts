@@ -194,12 +194,13 @@ export async function probeManyVideos(
   ffprobePath: string,
   files: ScannedFile[],
   jobs = 8,
+  signal?: AbortSignal,
 ): Promise<VideoFacts[]> {
   const out: VideoFacts[] = [];
   let cursor = 0;
   await Promise.all(
     Array.from({ length: Math.max(1, Math.min(jobs, files.length || 1)) }, async () => {
-      while (cursor < files.length) {
+      while (cursor < files.length && !signal?.aborted) {
         const f = files[cursor++];
         out.push(await probeVideo(ffprobePath, f.abs, f.mtime, f.size));
       }
@@ -256,7 +257,7 @@ export function extractVideoFramePng(
       outPngPath,
     );
 
-    const child = spawn(ffmpegPath, args, { windowsHide: true });
+    const child = spawn(ffmpegPath, args, { windowsHide: true, stdio: "ignore" });
     child.on("error", () => resolve(false));
     child.on("close", async (code) => {
       if (code !== 0) {
@@ -328,8 +329,11 @@ export async function verifyVideoOutputs(
           `duration mismatch (${src.durationSec.toFixed(1)}s -> ${out.durationSec.toFixed(1)}s)`,
         );
       }
-      const dateKept = Boolean(src?.dateOriginal) && Boolean(out?.dateOriginal);
-      if (src?.dateOriginal && !out?.dateOriginal) {
+      const dateKept =
+        r.status === "copied"
+          ? Boolean(out?.dateOriginal)
+          : Boolean(src?.dateOriginal) && Boolean(out?.dateOriginal);
+      if (r.status === "converted" && src?.dateOriginal && !out?.dateOriginal) {
         problems.push("QuickTime/container creation_time was lost");
       }
 
