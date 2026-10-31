@@ -1,5 +1,12 @@
 # Changelog
 
+## 1.3.2 - 2026-10-31
+
+- Fix comparison view preview for non-native original photo formats:
+  - Generate full-resolution JPEG display proxies for HEIC, HEIF, TIFF, and camera RAW files in `/api/source-file` so modern browsers and WebView2 can display them side-by-side with compressed variants.
+  - Generate lossless PNG display proxies for browser-unsupported output variants (JXL, HEIC, JP2) in `/api/compare` while preserving real encoded byte counts in the quality ladder.
+  - Add request cancellation listeners to cleanly abort ImageMagick decode jobs when compare requests change or close.
+
 ## 1.3.1 - 2026-10-31
 
 - Rebranded project to Compakta (`esconer/compakta`):

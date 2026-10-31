@@ -3422,7 +3422,7 @@ function createRunsView(actions) {
 }
 
 // src/version.ts
-var APP_VERSION = "1.3.1";
+var APP_VERSION = "1.3.2";
 
 // src/client/main.ts
 var THEME_IDS = ["midnight", "daylight", "ink", "sepia", "nord", "rose"];
