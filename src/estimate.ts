@@ -29,7 +29,16 @@ export type Estimate = {
   projectedSeconds: number;
   totalConvert: number;
   totalConvertBytes: number;
-  method: "sampled" | "flat";
+  /** "sampled": ≥1 sample encoded and measured. "flat": nothing to sample -
+   * clean structural guess. "unmeasured": samples were attempted and EVERY one
+   * failed - the byte projection falls back to flatRatio, and time must be
+   * read as unknown (projection is 0) instead of instant. */
+  method: "sampled" | "flat" | "unmeasured";
+  /** True only when nothing valid was sampled: zero means "unknown", not
+   * "instant". Callers (server passthrough, client render) gate on this. */
+  unmeasured: boolean;
+  /** Why the projection is unmeasured. Present only when unmeasured is true. */
+  unmeasuredReason?: string;
   durationMs: number;
   /** Which output format this measurement describes. */
   format: OutputFormat;
@@ -99,7 +108,7 @@ export async function estimateFromSample(opts: {
       ratio: opts.flatRatio, meanOutputBytes: 0, secondsPerImage: 0,
       projectedOutputBytes: totalCopyBytes,
       projectedSeconds: 0, totalConvert: 0, totalConvertBytes: 0,
-      method: "flat", durationMs: 0,
+      method: "flat", unmeasured: false, durationMs: 0,
       format: opts.policy.outputFormat,
     };
   }
@@ -168,6 +177,11 @@ export async function estimateFromSample(opts: {
   const projectedOutputBytes = Math.round(totalConvertBytes * ratio * variants + totalCopyBytes);
   const projectedSeconds = secondsPerImage * totalConvert * variants;
 
+  // A sample run where NOTHING encoded has no measurement at all: the flat
+  // ratio keeps the byte projection honest, but 0 seconds plus a "sampled"
+  // label read as "instant", which is the lie. Say unmeasured instead.
+  const unmeasured = producedCount === 0;
+
   return {
     sampleSize: producedCount,
     sampledBytes: measuredInputBytes,
@@ -179,7 +193,11 @@ export async function estimateFromSample(opts: {
     projectedSeconds,
     totalConvert,
     totalConvertBytes,
-    method: "sampled",
+    method: unmeasured ? "unmeasured" : "sampled",
+    unmeasured,
+    unmeasuredReason: unmeasured
+      ? `all ${sample.length} samples failed to encode - bytes projected from flatRatio ${opts.flatRatio}, time unknown`
+      : undefined,
     durationMs: Date.now() - started,
     format: opts.policy.outputFormat,
   };

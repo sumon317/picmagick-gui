@@ -1,8 +1,9 @@
 # Compakta
 
 A local desktop and browser app for compressing and converting photos and videos
-to modern, compact formats (AVIF, JPEG XL, WebP, HEIC, JPEG 2000, JPEG, PNG, AV1,
-HEVC, H.264, WebM) without modifying the originals. It scans a folder, lets you
+to modern, compact formats (photos: AVIF, JPEG XL, WebP, HEIC, JPEG 2000, JPEG,
+PNG; videos: AV1, HEVC, VP9) without modifying the originals. It scans a folder,
+lets you
 include or exclude subfolders, previews the output against a storage budget,
 processes with ImageMagick and FFmpeg, and records every run so it can be undone
 precisely.
@@ -84,7 +85,7 @@ x86_64 only. macOS is not officially supported.
 
 ## Requirements
 
-- **Source runs:** [Bun](https://bun.sh) 1.1 or newer. The desktop installer
+- **Source runs:** [Bun](https://bun.sh) 1.4 or newer. The desktop installer
   bundles its own Bun, so nothing needs to be installed first.
 - **Desktop runs:** the WebView2 runtime on Windows (included in current Windows
   10 and 11) or GTK 3 and WebKitGTK 4.1 on Linux.
@@ -176,7 +177,9 @@ cd compakta
 
    Open a new terminal afterwards so `bun` is on `PATH`.
 
-2. Install the small set of project dependencies:
+2. Optional: install the development dependencies. The app itself has no
+   runtime dependencies, so the launcher works without this step; `bun
+   install` is only needed for the development checks (`bun run check`).
 
    ```bat
    bun install
@@ -202,13 +205,14 @@ answer, and opens `http://127.0.0.1:5178`. Close that minimised
 
    Open a new terminal afterwards so `bun` is on `PATH`.
 
-2. Install dependencies and start the launcher:
+2. Start the launcher:
 
    ```bash
-   bun install
    chmod +x start.sh
    ./start.sh
    ```
+
+   `bun install` is optional here: only the development checks need it.
 
 `start.sh` runs the server in the foreground and opens
 `http://127.0.0.1:5178` with `xdg-open`. Use **Quit** in the page header or
@@ -221,7 +225,7 @@ Without either, type the path directly into the source or destination field.
 #### Terminal, either platform
 
 ```bash
-bun install       # first time, or after dependency changes
+bun install       # optional; only the development checks need it
 bun start         # open http://127.0.0.1:5178 yourself
 bun start:open    # start and open the browser
 bun run dev       # hot-reload the server while editing
@@ -241,9 +245,9 @@ $env:PORT=6000; bun start
 set PORT=6000 && bun start
 ```
 
-`start.bat` assumes the default port `5178`. For a custom port on either
-platform, start with `bun start` or `bun start:open` instead of the launcher
-scripts.
+`start.bat` uses the default port `5178` unless `PORT` is already set. For a
+custom port, set `PORT` before launching it, or start with `bun start` or
+`bun start:open` instead of the launcher scripts.
 
 The server listens on `127.0.0.1` only. It is not exposed to your network and
 has no login because it is designed to run on the same machine as the browser.
@@ -838,6 +842,9 @@ The Release workflow:
 - installs the Linux GTK 3 and WebKitGTK 4.1 build dependencies;
 - runs `bun run check` on both platforms;
 - runs `bun run desktop:build` (`electrobun build --env=stable`) on each;
+- builds full installers that embed the official ImageMagick build that is
+  current at release time, so full-install artifacts are not reproducible
+  (slim installers download ImageMagick at runtime instead);
 - refuses to continue when the tag, `package.json`, and `electrobun.config.ts`
   versions differ;
 - attaches the installers, update archives, and update metadata to the GitHub

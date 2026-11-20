@@ -68,21 +68,42 @@ export function createCompareView(actions: ViewActions): CompareViewController {
 
   const fileList = () => actions.selectedFiles();
 
+  // The <select> only lists up to this many files; arrow-key navigation and the
+  // per-file Compare action still reach every selected file (they use
+  // fileList() directly). Rendering 5k+ <option> nodes per rebuild froze the
+  // view, and the rebuild ran on every renderStage (ladder click, mode change).
+  const FILE_SELECT_CAP = 1000;
+  let fileSelectCache: { key: string; html: string } | null = null;
+
   const syncFileSelect = (rel: string | null): void => {
     const select = $<HTMLSelectElement>("compareFileSelect");
     const files = fileList();
     const nameOf = (value: string): string => value.split(/[\\/]/).pop() ?? value;
     const inList = rel ? files.some((f) => f.rel === rel) : false;
-    const options = files
-      .map((f) => `<option value="${escapeHtml(f.rel)}"${f.rel === rel ? " selected" : ""}>${escapeHtml(nameOf(f.rel))}</option>`)
-      .join("");
+    const overflow = Math.max(0, files.length - FILE_SELECT_CAP);
+    const shown = overflow ? files.slice(0, FILE_SELECT_CAP) : files;
+    // Cache on the selection shape only; the chosen entry is applied via
+    // select.value so ladder/mode re-renders never rebuild the option list.
+    const key = `${files.length}|${files[0]?.rel ?? ""}|${files[files.length - 1]?.rel ?? ""}`;
+    if (!fileSelectCache || fileSelectCache.key !== key) {
+      fileSelectCache = {
+        key,
+        html:
+          shown
+            .map((f) => `<option value="${escapeHtml(f.rel)}">${escapeHtml(nameOf(f.rel))}</option>`)
+            .join("") +
+          (overflow
+            ? `<option value="" disabled>… ${(overflow).toLocaleString()} more selected files (use the per-file Compare button or arrow keys)</option>`
+            : ""),
+      };
+    }
     if (rel && !inList) {
       // A per-file Compare action can open a file that is not selected.
       select.innerHTML =
-        `<option value="${escapeHtml(rel)}" selected>${escapeHtml(nameOf(rel))}</option>` + options;
+        `<option value="${escapeHtml(rel)}" selected>${escapeHtml(nameOf(rel))}</option>` + fileSelectCache.html;
       return;
     }
-    select.innerHTML = options;
+    select.innerHTML = fileSelectCache.html;
     if (rel) select.value = rel;
   };
 
@@ -118,7 +139,8 @@ export function createCompareView(actions: ViewActions): CompareViewController {
   };
 
   const formatDate = (mtime?: number): string => {
-    if (!mtime) return "Captured 2026-01-14 10:32";
+    // No mtime → nothing: a fabricated "Captured …" date is worse than none.
+    if (!mtime) return "";
     const d = new Date(mtime);
     const pad = (n: number) => String(n).padStart(2, "0");
     return `Captured ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -132,7 +154,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
 
     $("compareFacts").innerHTML = `
       <div class="meta-line-primary">${dimText} · ${escapeHtml(origExt)} · ${fmt(data.originalBytes)}</div>
-      <div class="meta-line-secondary">${escapeHtml(dateText)}</div>
+      ${dateText ? `<div class="meta-line-secondary">${escapeHtml(dateText)}</div>` : ""}
       <div class="meta-line-secondary" title="${escapeHtml(pathText)}">${escapeHtml(pathText)}</div>
     `;
   };
@@ -613,6 +635,7 @@ export function createCompareView(actions: ViewActions): CompareViewController {
     activeFormat = state.currentFormat;
     panX = 0;
     panY = 0;
+    fileSelectCache = null; // rebuild against the selection the view opens with
     const files = fileList();
     const wanted = rel ?? state.compareRel;
     const chosen =

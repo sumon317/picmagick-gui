@@ -272,7 +272,11 @@ export type Estimate = {
   projectedSeconds: number;
   totalConvert: number;
   totalConvertBytes: number;
-  method: "sampled" | "flat";
+  // "unmeasured" = every sample encode failed: projectedSeconds is then an
+  // unknown, not a zero. Optional so cached/older payloads still type-check.
+  method: "sampled" | "flat" | "unmeasured";
+  unmeasured?: boolean;
+  unmeasuredReason?: string;
   durationMs: number;
   format: OutputFormat;
 };
@@ -317,6 +321,13 @@ export type DuplicatesResponse = {
   duplicateBytes: number;
   hashedFiles: number;
   durationMs: number;
+  // Present in newer server payloads; absent → the UI must not change shape.
+  truncated?: boolean;
+  candidateCount?: number;
+  unhashedGroups?: number;
+  // Files that failed hashing outright (unreadable/locked). Independent of
+  // `truncated`: a small candidate set can still be incomplete if reads failed.
+  hashErrors?: number;
 };
 
 export type DatesResponse = {
@@ -567,4 +578,39 @@ export type VideoPolicy = {
   filmGrain: number;
   skipAlreadyEfficient: boolean;
   customParams: string;
+};
+
+/** GET /api/video/status (src/video/routes.ts subroute "status"). */
+export type VideoStatusResponse = {
+  sourceRoot: string;
+  photoDestination: string;
+  customDestination: string;
+  effectiveDestination: string;
+  budgetBytes: number;
+  ratio: number;
+  ratios: Record<string, number>;
+  outputFormat: OutputFormat;
+  formats: FormatSpec[];
+  presets?: unknown;
+  policy: VideoPolicy;
+  scanned: boolean;
+  videoCount: number;
+  videoBytes: number;
+  freeBytes: number | null;
+  freeLabel: string;
+  /**
+   * FFmpeg presence + hardware encoder names + per-format write support, as
+   * reported by tryFfmpeg() (server type FfmpegInfo in src/video/ffmpeg.ts).
+   * The server sends `formats: Record<VideoOutputFormat, FormatSupport>` where
+   * FormatSupport = { mode: string; writable: boolean; detail: string | null }.
+   * Mirrored here with tolerant optional fields so older payloads degrade to
+   * "unknown support" instead of crashing the format cards.
+   */
+  ffmpeg: {
+    version?: string;
+    hwEncoders?: { av1?: string | null; hevc?: string | null };
+    formats?: Record<string, { mode?: string; writable?: boolean; detail?: string | null }>;
+  } | null;
+  liveJobId: string | null;
+  pausedJobId: string | null;
 };

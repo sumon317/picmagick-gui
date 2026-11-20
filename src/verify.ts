@@ -6,6 +6,7 @@
  * dimensions are non-zero, and the capture date is still attached.
  */
 import { stat } from "node:fs/promises";
+import path from "node:path";
 import type { FileResult } from "./convert.ts";
 import { identify, type ImageFacts } from "./meta.ts";
 import { runPool } from "./convert.ts";
@@ -51,6 +52,7 @@ export async function verifyOutputs(
 
   await runPool(sample, opts.signal ?? new AbortController().signal, async (r) => {
     const problems: string[] = [];
+    const converted = r.status === "converted";
     let src: ImageFacts | undefined;
     let out: ImageFacts | undefined;
 
@@ -58,17 +60,21 @@ export async function verifyOutputs(
       const st = await stat(r.out!);
       if (st.size === 0) problems.push("output is empty");
       // Copied files are byte-identical by construction; only conversions need decoding.
-      if (r.status === "converted") {
-        [src, out] = await Promise.all([identify(magickPath, r.src), identify(magickPath, r.out!)]);
+      if (converted) {
+        [src, out] = await Promise.all([
+          identify(magickPath, r.src, opts.signal),
+          identify(magickPath, r.out!, opts.signal),
+        ]);
       } else {
-        out = await identify(magickPath, r.out!);
+        out = await identify(magickPath, r.out!, opts.signal);
       }
     } catch (err) {
       problems.push((err as Error).message.slice(0, 120));
     }
 
+    if (converted && src && !src.ok) problems.push(`cannot decode source: ${src.error ?? "unknown"}`);
     if (out && !out.ok) problems.push(`cannot decode: ${out.error ?? "unknown"}`);
-    if (out?.width !== undefined && out?.height !== undefined && (out.width === 0 || out.height === 0)) {
+    if (out?.ok && (!out.width || !out.height)) {
       problems.push("zero dimensions");
     }
 
@@ -76,10 +82,10 @@ export async function verifyOutputs(
     const expectedWidth = swapped ? src?.height : src?.width;
     const expectedHeight = swapped ? src?.width : src?.height;
 
-    if (expectedWidth && out?.width && expectedWidth !== out.width) {
+    if (converted && expectedWidth && out?.width && expectedWidth !== out.width) {
       problems.push(`width changed ${expectedWidth} -> ${out.width}`);
     }
-    if (expectedHeight && out?.height && expectedHeight !== out.height) {
+    if (converted && expectedHeight && out?.height && expectedHeight !== out.height) {
       problems.push(`height changed ${expectedHeight} -> ${out.height}`);
     }
 
@@ -87,8 +93,40 @@ export async function verifyOutputs(
       r.status === "copied"
         ? Boolean(out?.dateOriginal)
         : Boolean(src?.dateOriginal) && Boolean(out?.dateOriginal);
-    if (r.status === "converted" && src?.dateOriginal && !out?.dateOriginal) {
+    if (converted && src?.dateOriginal && !out?.dateOriginal) {
       problems.push("EXIF DateTimeOriginal was lost");
+    }
+
+    // Multi-quality runs write one encode per quality; only the primary out is
+    // r.out. Every secondary variant must decode to the same oriented pixels
+    // and keep the date too - a broken q90 deserves the same scrutiny as q60.
+    // Falls back to primary-only for Results without an outs[] list.
+    if (converted) {
+      for (const v of (r.outs ?? []).filter((w) => w.out !== r.out)) {
+        const tag = `[variant ${path.basename(v.out)}]`;
+        let facts: ImageFacts | undefined;
+        try {
+          facts = await identify(magickPath, v.out, opts.signal);
+        } catch (err) {
+          problems.push(`${tag} probe failed: ${(err as Error).message.slice(0, 100)}`);
+          continue;
+        }
+        if (!facts.ok) problems.push(`${tag} cannot decode: ${facts.error ?? "unknown"}`);
+        else {
+          if (!facts.width || !facts.height) {
+            problems.push(`${tag} zero dimensions`);
+          }
+          if (expectedWidth && facts.width && expectedWidth !== facts.width) {
+            problems.push(`${tag} width changed ${expectedWidth} -> ${facts.width}`);
+          }
+          if (expectedHeight && facts.height && expectedHeight !== facts.height) {
+            problems.push(`${tag} height changed ${expectedHeight} -> ${facts.height}`);
+          }
+          if (src?.dateOriginal && !facts.dateOriginal) {
+            problems.push(`${tag} EXIF DateTimeOriginal was lost`);
+          }
+        }
+      }
     }
 
     rows.push({

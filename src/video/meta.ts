@@ -8,7 +8,7 @@ import { rename, rm, stat } from "node:fs/promises";
 import path from "node:path";
 import type { FileResult } from "../convert.ts";
 import { runPool } from "../convert.ts";
-import { dateFromName, type DateReport } from "../meta.ts";
+import { dateFromName, exifDateYear, type DateReport } from "../meta.ts";
 import type { ScannedFile } from "../scan.ts";
 import type { VerifyReport, VerifyRow } from "../verify.ts";
 
@@ -96,7 +96,7 @@ export function probeVideo(
         "-show_streams",
         file,
       ],
-      { windowsHide: true },
+      { windowsHide: true, stdio: ["ignore", "pipe", "pipe"] },
     );
 
     const killChild = () => {
@@ -112,7 +112,7 @@ export function probeVideo(
     let out = "";
     let err = "";
     child.stdout.on("data", (d) => {
-      if (out.length < 64_000) out += String(d);
+      if (out.length < 1_048_576) out += String(d);
     });
     child.stderr.on("data", (d) => {
       if (err.length < 4_000) err += String(d);
@@ -239,12 +239,14 @@ export function buildVideoDateReport(facts: VideoFacts[]): DateReport {
     let when: string | null = f.dateOriginal ?? null;
     if (when) {
       withExif++;
-    } else {
-      const base = f.path.split(/[\\/]/).pop() ?? f.path;
-      when = dateFromName(base);
-      if (when) fromNameOnly++;
-      else undated.push(f.path);
+      const exifYear = exifDateYear(when);
+      if (exifYear) byYear[exifYear] = (byYear[exifYear] ?? 0) + 1;
+      continue;
     }
+    const base = f.path.split(/[\\/]/).pop() ?? f.path;
+    when = dateFromName(base);
+    if (when) fromNameOnly++;
+    else undated.push(f.path);
     const year = when?.slice(0, 4);
     if (year) byYear[year] = (byYear[year] ?? 0) + 1;
   }
@@ -359,11 +361,11 @@ export async function verifyVideoOutputs(
         if (st.size === 0) problems.push("output is empty");
         if (r.status === "converted") {
           [src, out] = await Promise.all([
-            probeVideo(ffprobePath, r.src),
-            probeVideo(ffprobePath, r.out!),
+            probeVideo(ffprobePath, r.src, undefined, undefined, opts.signal),
+            probeVideo(ffprobePath, r.out!, undefined, undefined, opts.signal),
           ]);
         } else {
-          out = await probeVideo(ffprobePath, r.out!);
+          out = await probeVideo(ffprobePath, r.out!, undefined, undefined, opts.signal);
         }
       } catch (err) {
         problems.push((err as Error).message.slice(0, 120));
@@ -372,7 +374,7 @@ export async function verifyVideoOutputs(
       if (out && !out.ok) {
         problems.push(`cannot probe output: ${out.error ?? "unknown"}`);
       }
-      if (out?.width !== undefined && out?.height !== undefined && (out.width === 0 || out.height === 0)) {
+      if (out?.ok && (!out.width || !out.height)) {
         problems.push("zero video dimensions");
       }
       if (

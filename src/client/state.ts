@@ -21,6 +21,7 @@ import type {
   SyncResponse,
   TreeNode,
   UpdateStatus,
+  VideoStatusResponse,
 } from "./types";
 
 export type ViewName = "workspace" | "run" | "compare" | "runs" | "health";
@@ -100,7 +101,7 @@ export type AppState = {
   mediaMode: "image" | "video";
   videoDestMode: "merge" | "subfolder" | "custom";
   videoCustomDestination: string;
-  videoStatus: any;
+  videoStatus: VideoStatusResponse | null;
 };
 
 const emptyRun = (): RunState => ({

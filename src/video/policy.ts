@@ -163,6 +163,19 @@ export function normaliseVideoPolicy(p?: Partial<VideoPolicy>): VideoPolicy {
   };
 }
 
+function stripTrailingSeparatorsSafe(p: string): string {
+  if (p === "/" || p === "\\" || /^[A-Za-z]:[\\/]$/.test(p)) return p;
+  return p.replace(/[\\/]+$/, "");
+}
+
+export function defaultVideoDestination(
+  sourceRoot: string,
+  format: VideoOutputFormat,
+): string {
+  const suffix = VIDEO_FORMAT_SPECS[format].destinationSuffix;
+  return `${stripTrailingSeparatorsSafe(sourceRoot)}-${suffix}`;
+}
+
 export function resolveVideoDestination(
   sourceRoot: string,
   photoDest: string,
@@ -172,8 +185,7 @@ export function resolveVideoDestination(
   const custom = customDest.trim();
   if (policy.destMode === "custom") {
     if (custom) return custom;
-    const suffix = VIDEO_FORMAT_SPECS[policy.outputFormat].destinationSuffix;
-    return `${sourceRoot.replace(/[\\/]+$/, "")}-${suffix}`;
+    return defaultVideoDestination(sourceRoot, policy.outputFormat);
   }
   if (policy.destMode === "subfolder") {
     return path.join(photoDest, "video");

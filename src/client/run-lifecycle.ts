@@ -6,7 +6,7 @@
  * completion state.
  */
 import { api, resolveApiRoute } from "./api";
-import { fmt } from "./dom";
+import { createFrameCoalescer, fmt } from "./dom";
 import { resetRun, state } from "./state";
 import type {
   JobSnapshot,
@@ -49,6 +49,13 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
   const render = (): void => {
     options.render();
   };
+
+  // Per-file SSE progress arrives far faster than the DOM can usefully repaint
+  // on a 2k+ file run (progress → up to 4 renders). Progress state changes are
+  // coalesced to one render per animation frame; state transitions (start,
+  // paused, finish, error, hello) render immediately instead, and a flush
+  // cancels any queued frame rather than double-rendering.
+  const renderCoalesced = createFrameCoalescer(render);
 
   const setActivity = (file: FileResult | undefined): void => {
     if (!file) return;
@@ -121,6 +128,7 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
   };
 
   const handleEvent = (event: ProgressEvent): void => {
+    let coalesce = false;
     if (event.type === "hello") {
       if (event.jobId) state.run.id = event.jobId;
       if (event.state) {
@@ -134,6 +142,7 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
       if (event.total != null) state.run.total = event.total;
       state.run.note = event.message ?? null;
     } else if (event.type === "progress") {
+      coalesce = true;
       state.run.state = "running";
       state.running = true;
       state.starting = false;
@@ -175,6 +184,7 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
       finish(event);
       return;
     } else if (event.type === "error") {
+      document.title = "Compakta";
       state.es?.close();
       state.es = null;
       state.currentJob = null;
@@ -190,7 +200,8 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
       options.onError(event.message ?? "The run failed.");
       void options.onFinished();
     }
-    render();
+    if (coalesce) renderCoalesced.request();
+    else renderCoalesced.flush();
   };
 
   const stream = (jobId: string): void => {
@@ -299,7 +310,7 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
       }
     }
     state.starting = false;
-    state.running = true;
+    if (!replay) state.running = true;
     stream(jobId);
     render();
   };
@@ -360,10 +371,17 @@ export function createRunLifecycle(options: RunLifecycleOptions): RunLifecycle {
   const post = async (path: string, success?: string): Promise<boolean> => {
     if (!state.currentJob) return false;
     try {
-      await api(path, { method: "POST" });
+      // The control routes answer 200 with {ok:false,message} for refusals
+      // (already paused, nothing to resume, cancel after finish, …). Surfacing
+      // the message verbatim keeps Pause/Resume/Cancel from lying as success.
+      const res = await api<{ ok?: boolean; message?: string }>(path, { method: "POST" });
+      if (res && res.ok === false) {
+        options.onError(res.message ?? "That action was refused.");
+        return false;
+      }
       if (success) {
         state.run.note = success;
-        render();
+        renderCoalesced.flush();
       }
       return true;
     } catch (error) {

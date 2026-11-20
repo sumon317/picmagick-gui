@@ -36,7 +36,7 @@ const PROBE_FIELDS = [
   { key: "depth", expr: "%z" },
   { key: "colorspace", expr: "%[colorspace]" },
   { key: "orientation", expr: "%[orientation]" },
-  { key: "filesize", expr: "%b" },
+  { key: "filesize", expr: "%B" },
   { key: "dateOriginal", expr: "%[EXIF:DateTimeOriginal]" },
   { key: "make", expr: "%[EXIF:Make]" },
   { key: "model", expr: "%[EXIF:Model]" },
@@ -126,14 +126,32 @@ export async function identifyMany(
   return out;
 }
 
-/** Filename dates like 20240724_225458 or IMG_20240724_225458 are a usable fallback. */
-const NAME_DATE = /(?:^|[^\d])(\d{4})(\d{2})(\d{2})[_\-\sT]?(\d{2})?(\d{2})?(\d{2})?/;
+/**
+ * Filename dates like IMG_20240724_225458 (contiguous), 2024-07-24 (dashed
+ * ISO), 2024-07-24_12-30-00 or 2024-07-24T22:54:58 are a usable fallback.
+ *
+ * Separators between the date groups are tolerated (dash, dot, loose space);
+ * immediacy is preserved by the non-digit anchor. Time-internal separators are
+ * optional so contiguous HHMMSS stems keep minutes/seconds. A 15-digit blob
+ * ("123456787654321") still cannot slip through: the calendar round-trip and
+ * the h/mi/s bounds below reject the resulting nonsense fields, and the year
+ * floor (1970) rejects most arbitrary digit runs.
+ */
+const NAME_DATE =
+  /(?:^|[^\d])(\d{4})(?:[._\-]?\s?)(\d{2})(?:[._\-]?\s?)(\d{2})(?:[._\-:\sT]?(\d{2})(?:[._\-:]?(\d{2})(?:[._\-:]?(\d{2}))?)?)?/;
 
 export function dateFromName(name: string): string | null {
   const m = NAME_DATE.exec(name);
   if (!m) return null;
   const [, y, mo, d, h, mi, s] = m;
-  if (+y < 1970 || +y > 2100 || +mo < 1 || +mo > 12 || +d < 1 || +d > 31) return null;
+  const year = +y, month = +mo, day = +d;
+  // Bound the year (photo filenames predate 1970), reject days that don't
+  // exist (Feb 30, non-leap Feb 29) by round-tripping through UTC, and any
+  // 24+/60+ time fields.
+  if (year < 1970 || year > 2100 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const real = new Date(Date.UTC(year, month - 1, day));
+  if (real.getUTCFullYear() !== year || real.getUTCMonth() !== month - 1 || real.getUTCDate() !== day) return null;
+  if ((h && +h > 23) || (mi && +mi > 59) || (s && +s > 59)) return null;
   return `${y}:${mo}:${d} ${h ?? "00"}:${mi ?? "00"}:${s ?? "00"}`;
 }
 
@@ -145,6 +163,24 @@ export type DateReport = {
   byYear: Record<string, number>;
 };
 
+/**
+ * Broken camera clocks write DateTimeOriginal like "0000:00:00 00:00:00" or
+ * "2023:02:30 10:00:00". That is noise, not a year: validate the YYYY:MM:DD
+ * head (real calendar day, floored at 1900) before it lands in the by-year
+ * tally. The field still counts towards withExif - it IS present in the file.
+ */
+const EXIF_DATE_HEAD = /^(\d{4})[:\-](\d{2})[:\-](\d{2})/;
+export function exifDateYear(when: string): string | null {
+  const m = EXIF_DATE_HEAD.exec(when);
+  if (!m) return null;
+  const year = +m[1], month = +m[2], day = +m[3];
+  if (year < 1900 || month < 1 || month > 12 || day < 1 || day > 31) return null;
+  const real = new Date(Date.UTC(year, month - 1, day));
+  // Date.UTC(99, ...) would map to 1999 - the round-trip also catches that.
+  if (real.getUTCFullYear() !== year || real.getUTCMonth() !== month - 1 || real.getUTCDate() !== day) return null;
+  return m[1];
+}
+
 export function buildDateReport(facts: ImageFacts[]): DateReport {
   const byYear: Record<string, number> = {};
   const undated: string[] = [];
@@ -153,13 +189,18 @@ export function buildDateReport(facts: ImageFacts[]): DateReport {
 
   for (const f of facts) {
     let when: string | null = f.dateOriginal ?? null;
-    if (when) withExif++;
-    else {
-      const base = f.path.split(/[\\/]/).pop() ?? f.path;
-      when = dateFromName(base);
-      if (when) fromNameOnly++;
-      else undated.push(f.path);
+    if (when) {
+      withExif++;
+      // Invalid EXIF year ("0000:00:00" and friends): count the field as
+      // present but do NOT trust its year into the tally - skip, per M-3.
+      const exifYear = exifDateYear(when);
+      if (exifYear) byYear[exifYear] = (byYear[exifYear] ?? 0) + 1;
+      continue;
     }
+    const base = f.path.split(/[\\/]/).pop() ?? f.path;
+    when = dateFromName(base);
+    if (when) fromNameOnly++;
+    else undated.push(f.path);
     const year = when?.slice(0, 4);
     if (year) byYear[year] = (byYear[year] ?? 0) + 1;
   }

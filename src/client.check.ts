@@ -114,5 +114,81 @@ if (/traffic-light|titleBarStyle\s*[:=]\s*["']hiddenInset/.test(html)) {
   console.log("  no macOS-only chrome in index.html");
 }
 
+// ── 4. fold parity: client tree-logic.ts ↔ server policy.ts ──────────────────
+// The client bundler cannot import a server-side leaf (policy.ts pulls in
+// node:path etc.), and both fold implementations are module-private, so a
+// direct runtime equality check is impossible. Instead we (a) compare the two
+// implementations' algorithm "fingerprints" straight from source — the check
+// fails the moment either file drifts — and (b) exercise an inlined copy of
+// that exact algorithm against the documented edge cases. The fingerprints tie
+// the inlined copy to the real code rather than faking parity.
+console.log(`\n== fold parity (client ↔ server) ==`);
+const treeLogicSrc = readFileSync("src/client/tree-logic.ts", "utf8");
+const policySrc = readFileSync("src/policy.ts", "utf8");
+
+const SLASH_DEF_RE = /const SLASH_LIKE = \/(.+?)\/g;/;
+const treeSlash = treeLogicSrc.match(SLASH_DEF_RE)?.[1];
+const policySlash = policySrc.match(SLASH_DEF_RE)?.[1];
+if (!treeSlash || !policySlash || treeSlash !== policySlash) {
+  bad++;
+  console.log(`  SLASH_LIKE definitions differ (tree-logic=${treeSlash}, policy=${policySlash})`);
+} else {
+  console.log(`  SLASH_LIKE lookalike family identical in both files`);
+}
+
+const FOLD_CORE_RE = /\.normalize\("NFC"\)[\s\S]*?folded\.toLowerCase\(\)\s*:\s*folded/;
+const canon = (s: string): string =>
+  s.replace(/\s+/g, "").replace(/CASE_INSENSITIVE|caseInsensitive/g, "CI");
+const treeCore = treeLogicSrc.match(FOLD_CORE_RE)?.[0];
+const policyCore = policySrc.match(FOLD_CORE_RE)?.[0];
+if (!treeCore || !policyCore || canon(treeCore) !== canon(policyCore)) {
+  bad++;
+  console.log(`  fold algorithm drifted between tree-logic.ts and policy.ts`);
+} else {
+  console.log(`  fold algorithm equivalent in both files (modulo CI variable name)`);
+}
+
+// Inlined copy of the canonical algorithm above (verified against both real
+// files by the fingerprints). Behavioural vectors for the four categories the
+// contract calls out: NFC/NFD, SLASH_LIKE lookalikes, trailing slashes, and
+// case-insensitive on/off.
+const INLINE_SLASH_LIKE = /[\u002F\u005C\u2044\u2215\u29F5\u29F8\uFF0F\uFF3C]/g;
+// The two source fingerprints above catch one-sided drift. This one catches
+// COORDINATED drift: if both real files change but the inlined copy used by the
+// behavioural vectors below does not, the vectors would silently test a stale
+// family. Tie the inlined regex to the real tree-logic.ts definition directly.
+if (INLINE_SLASH_LIKE.source !== treeSlash) {
+  bad++;
+  console.log(`  inlined SLASH_LIKE drifted from tree-logic.ts (inline=${INLINE_SLASH_LIKE.source}, tree=${treeSlash})`);
+} else {
+  console.log(`  inlined SLASH_LIKE matches tree-logic.ts SLASH_LIKE`);
+}
+const referenceFold = (s: string, caseInsensitive: boolean): string => {
+  const folded = s.normalize("NFC").replace(INLINE_SLASH_LIKE, "/").replace(/\/+$/, "");
+  return caseInsensitive ? folded.toLowerCase() : folded;
+};
+const parityVectors: Array<{ label: string; inputs: string[]; ci: boolean; want: string }> = [
+  { label: "NFC vs NFD", inputs: ["caf\u00e9", "cafe\u0301"], ci: false, want: "caf\u00e9" },
+  {
+    label: "slash lookalikes",
+    inputs: ["a/b", "a\u2044b", "a\u2215b", "a\u29f5b", "a\u29f8b", "a\uff0fb", "a\uff3cb", "a\\b"],
+    ci: false,
+    want: "a/b",
+  },
+  { label: "trailing slashes", inputs: ["album", "album/", "album///", "album\u2044"], ci: false, want: "album" },
+  { label: "case-insensitive on", inputs: ["Album"], ci: true, want: "album" },
+  { label: "case-insensitive off", inputs: ["Album"], ci: false, want: "Album" },
+];
+let parityFails = 0;
+for (const v of parityVectors) {
+  const wrong = v.inputs.filter((input) => referenceFold(input, v.ci) !== v.want);
+  if (wrong.length) {
+    bad++;
+    parityFails++;
+    console.log(`  ${v.label}: expected ${JSON.stringify(v.want)}, got ${wrong.map((w) => JSON.stringify(referenceFold(w, v.ci))).join(", ")}`);
+  }
+}
+console.log(`  fold parity: ${parityVectors.length - parityFails}/${parityVectors.length} vectors agree`);
+
 console.log(bad ? `\n${bad} problem(s)` : "\nclient OK");
 if (bad) process.exit(1);

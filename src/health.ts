@@ -1,9 +1,10 @@
 /**
  * Health check: everything that would silently ruin a long run, surfaced up front.
  */
-import { stat } from "node:fs/promises";
+import { access, stat } from "node:fs/promises";
+import { constants } from "node:fs";
 import path from "node:path";
-import { findMagick, freeSpace, type MagickInfo } from "./paths.ts";
+import { assertDestinationSafe, findMagick, freeSpace, type MagickInfo } from "./paths.ts";
 import { FORMAT_SPECS, type OutputFormat } from "./formats.ts";
 
 export type HealthCheck = {
@@ -62,6 +63,7 @@ export async function runHealthCheck(
   // --- source readable ---
   try {
     const st = await stat(sourceRoot);
+    if (st.isDirectory()) await access(sourceRoot, constants.R_OK);
     checks.push({
       id: "source",
       label: "Source readable",
@@ -75,30 +77,57 @@ export async function runHealthCheck(
     });
   }
 
+  // --- destination safety (never inside source) ---
+  try {
+    assertDestinationSafe(sourceRoot, destination);
+  } catch (err) {
+    checks.push({
+      id: "dest-safe",
+      label: "Output safety",
+      status: "fail",
+      detail: (err as Error).message,
+    });
+  }
+
   // --- destination writable ---
   try {
     const st = await stat(destination);
-    if (!st.isDirectory()) throw new Error("not a directory");
-    const { access } = await import("node:fs/promises");
-    await access(destination, (await import("node:fs")).constants.W_OK);
-    checks.push({ id: "dest", label: "Output writable", status: "ok", detail: destination });
-  } catch (err) {
-    const { access } = await import("node:fs/promises");
-    const { constants } = await import("node:fs");
-    let ancestor = path.dirname(path.resolve(destination));
-    while (ancestor && ancestor !== path.dirname(ancestor)) {
-      try { await stat(ancestor); break; } catch { ancestor = path.dirname(ancestor); }
+    if (!st.isDirectory()) {
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: "fail",
+        detail: `${destination} is a file, not a directory`,
+      });
+    } else {
+      await access(destination, constants.W_OK);
+      checks.push({ id: "dest", label: "Output writable", status: "ok", detail: destination });
     }
-    let parentWritable = false;
-    try { await access(ancestor, constants.W_OK); parentWritable = true; } catch { /* not writable */ }
-    checks.push({
-      id: "dest",
-      label: "Output writable",
-      status: parentWritable ? "warn" : "fail",
-      detail: parentWritable
-        ? `${destination} - will be created (${(err as Error).message.slice(0, 60)})`
-        : `${destination} - parent folder "${ancestor}" is not writable`,
-    });
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      let ancestor = path.dirname(path.resolve(destination));
+      while (ancestor && ancestor !== path.dirname(ancestor)) {
+        try { await stat(ancestor); break; } catch { ancestor = path.dirname(ancestor); }
+      }
+      let parentWritable = false;
+      try { await access(ancestor, constants.W_OK); parentWritable = true; } catch { /* not writable */ }
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: parentWritable ? "warn" : "fail",
+        detail: parentWritable
+          ? `${destination} - will be created`
+          : `${destination} - parent folder "${ancestor}" is not writable`,
+      });
+    } else {
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: "fail",
+        detail: `${destination} - not writable (${(err as Error).message.slice(0, 60)})`,
+      });
+    }
   }
 
   // --- disk headroom ---

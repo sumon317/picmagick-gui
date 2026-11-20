@@ -40,6 +40,7 @@ export type VideoRunOptions = {
   jobs: number;
   cpuLimit?: number;
   getLimit?: () => number;
+  onWake?: (wake: () => void) => void;
   getCpuLimit?: () => number;
   onChildSpawn?: (pid: number) => void;
   onChildExit?: (pid: number) => void;
@@ -63,6 +64,7 @@ async function atomicCopyFile(
   signal: AbortSignal,
 ): Promise<number> {
   await mkdir(path.dirname(dest), { recursive: true });
+  if (signal.aborted) throw new Error("aborted");
   const part = partPathFor(dest);
   try {
     await copyFile(src, part);
@@ -127,6 +129,7 @@ function runFfmpegWithProgress(
     const child = spawn(ffmpegExe, args, {
       windowsHide: true,
       detached: process.platform === "linux",
+      stdio: ["ignore", "pipe", "pipe"],
     });
 
     if (child.pid) {
@@ -271,6 +274,10 @@ async function processOneVideo(
       d.file.size,
       o.signal,
     );
+
+    if (o.signal.aborted) {
+      return { ...base, status: "cancelled", seconds: (Date.now() - started) / 1000 };
+    }
 
     const finalOut = videoOutputPathFor(d, o.sourceRoot, o.effectiveDestination, o.policy);
     if (!(await overwriteOk(finalOut, o.overwrite))) {
@@ -523,6 +530,7 @@ export async function runVideoConversion(
     },
     shouldStop,
     options.getLimit ?? (() => 1),
+    options.onWake,
   );
 
   return {

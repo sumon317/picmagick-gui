@@ -63,9 +63,6 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     caseInsensitive: state.status?.caseInsensitive ?? true,
   });
 
-  const fold = (value: string): string =>
-    (state.status?.caseInsensitive ?? true) ? value.toLowerCase() : value;
-
   const allFiles = (): ScannedFile[] => {
     if (!state.tree) return [];
     if (!flatCache) {
@@ -97,15 +94,12 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
 
   const selectedBytes = (): number => selected().reduce((sum, file) => sum + file.size, 0);
 
-  const prune = (): void => {
-    if (!state.tree) return;
-    const folders = new Set(treeLogic.collectRels(state.tree).map(fold));
-    const files = new Set(allFiles().map((file) => fold(file.rel)));
-    state.excluded = new Set([...state.excluded].filter((rel) => folders.has(fold(rel))));
-    state.included = new Set([...state.included].filter((rel) => folders.has(fold(rel))));
-    state.excludedFiles = new Set([...state.excludedFiles].filter((rel) => files.has(fold(rel))));
-    state.includedFiles = new Set([...state.includedFiles].filter((rel) => files.has(fold(rel))));
-  };
+  // NOTE: no prune() here by design. Rules for folders/files that are missing
+  // from the current tree, or that only fold-match it (NFD names, lookalike
+  // slashes), are inert server-side but MUST survive: dropping them and then
+  // saving the policy would destroy exclusions the user persisted earlier.
+  // pruned-tree cleanup happens through toggleFolder/clearFileOverridesUnder
+  // only, which touch exactly the subtree the user toggled.
 
   const matchesActiveMode = (file: ScannedFile): boolean => {
     return state.mediaMode === "video"
@@ -368,7 +362,15 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     check.indeterminate = indeterminate;
     check.setAttribute("aria-label", `Include ${node.name} and everything in it`);
     check.addEventListener("click", (event) => event.stopPropagation());
-    check.addEventListener("change", () => setExcluded(node.rel, !check.checked));
+    // The browser clears indeterminate and flips checked before "change"
+    // fires, so the pre-click partial state captured at render time is the only
+    // reliable source of intent. Per the authoritative wave-1 fix (a311c6c,
+    // "clicking an indeterminate folder checkbox now includes all of it") and
+    // the integration ledger (F-03), a first click on a partially-selected
+    // folder must INCLUDE everything in it -> setExcluded(..., false). Reading
+    // check.checked for a partial folder here would be wrong for that reason.
+    const wasPartial = indeterminate;
+    check.addEventListener("change", () => setExcluded(node.rel, wasPartial ? false : !check.checked));
 
     const caret = document.createElement("button");
     caret.type = "button";
@@ -562,7 +564,6 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     state.excludedFiles = files.excludedFiles;
     state.includedFiles = files.includedFiles;
     if (exclude) state.expanded.add(rel);
-    prune();
     render();
     notify();
   };
@@ -573,7 +574,6 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
     );
     state.excludedFiles = result.excludedFiles;
     state.includedFiles = result.includedFiles;
-    prune();
     render();
     notify();
   };
@@ -595,7 +595,8 @@ export function createLibrary(opts: LibraryOptions): LibraryController {
       state.filterQuery = "";
       filterInput.value = "";
     }
-    prune();
+    // No prune(): rules kept from a previous scan (vanished folders, policy
+    // carried across rescans) stay verbatim so boot/refresh never destroys them.
     render();
     opts.onChange();
   };

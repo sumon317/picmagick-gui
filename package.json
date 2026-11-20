@@ -7,7 +7,7 @@
   "license": "MIT",
   "author": "Compakta contributors",
   "engines": {
-    "bun": ">=1.1.0"
+    "bun": ">=1.4.0"
   },
   "scripts": {
     "dev": "bun run --hot src/server.ts",
@@ -25,7 +25,7 @@
     "check": "bun run build:client && bun run typecheck && bun run src/client.check.ts && bun run src/platform.check.ts && bun run src/format.check.ts && bun run src/video.check.ts"
   },
   "devDependencies": {
-    "@types/bun": "latest",
+    "@types/bun": "^1.4.3",
     "@types/node": "^26.6.5",
     "electrobun": "2.0.5",
     "typescript": "^7.0.2"

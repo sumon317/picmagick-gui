@@ -54,9 +54,21 @@ export async function writeManifest(
   base: Omit<Manifest, "entries" | "summary" | "id">,
   results: FileResult[],
 ): Promise<Manifest> {
-  const entries: ManifestEntry[] = results
-    .filter((r) => r.out && (r.status === "converted" || r.status === "copied"))
-    .map((r) => ({ out: r.out!, src: r.src, status: r.status, bytes: r.outBytes, at: Date.now() }));
+  const now = Date.now();
+  const entries: ManifestEntry[] = [];
+  // Multi-quality runs write several variants per source; r.outs carries every
+  // one of them, so undo can remove them all and verify can audit each. Results
+  // from before the outs[] field (or plain copies) only have r.out.
+  for (const r of results) {
+    if (r.status !== "converted" && r.status !== "copied") continue;
+    if (r.outs?.length) {
+      for (const f of r.outs) {
+        entries.push({ out: f.out, src: r.src, status: r.status, bytes: f.bytes, at: now });
+      }
+    } else if (r.out) {
+      entries.push({ out: r.out, src: r.src, status: r.status, bytes: r.outBytes, at: now });
+    }
+  }
 
   const manifest: Manifest = {
     ...base,
@@ -75,7 +87,12 @@ export async function writeManifest(
   const target = manifestPath(destination, id);
   const tmp = `${target}.tmp-${process.pid}`;
   await writeFile(tmp, JSON.stringify(manifest, null, 2), "utf8");
-  await rename(tmp, target);
+  try {
+    await rename(tmp, target);
+  } catch (err) {
+    await rm(tmp, { force: true }).catch(() => {});
+    throw err;
+  }
   return manifest;
 }
 
@@ -109,12 +126,15 @@ export async function undoManifest(
   opts: { dryRun?: boolean } = {},
 ): Promise<UndoResult> {
   const destRoot = pathKey(path.resolve(manifest.destination));
+  // A drive-root destination ("D:\") already ends in the separator; tacking on
+  // another would turn every startsWith comparison into a refusal.
+  const destPrefix = destRoot.endsWith(path.sep) ? destRoot : destRoot + path.sep;
   const res: UndoResult = { removed: 0, missing: 0, bytesFreed: 0, refused: 0, errors: [] };
   const candidateDirs = new Set<string>();
 
   for (const e of manifest.entries) {
     const target = path.resolve(e.out);
-    if (!pathKey(target).startsWith(destRoot + path.sep)) {
+    if (!pathKey(target).startsWith(destPrefix)) {
       res.refused++;
       continue;
     }
@@ -128,7 +148,7 @@ export async function undoManifest(
         await rm(target, { force: true });
         res.removed++;
         let dir = path.dirname(target);
-        while (pathKey(dir).startsWith(destRoot + path.sep)) {
+        while (pathKey(dir).startsWith(destPrefix)) {
           candidateDirs.add(dir);
           dir = path.dirname(dir);
         }

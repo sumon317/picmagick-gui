@@ -6,7 +6,7 @@
 import { api } from "../api";
 import { $, escapeHtml, fmt, icon, relativeTime, shortVersion } from "../dom";
 import { state } from "../state";
-import type { HealthReport, UpdateStatus } from "../types";
+import type { HealthReport, UpdateStatus, VideoStatusResponse } from "../types";
 import type { ViewActions } from "./shared";
 import { checkIcon, statusWord } from "./shared";
 
@@ -196,7 +196,7 @@ export function createHealthView(actions: ViewActions): HealthViewController {
       void api("video/ffmpeg/install", { method: "POST", body: {} })
         .then(() => {
           actions.toast("FFmpeg installed successfully!", "success");
-          return api<any>("video/status").then((vStatus) => {
+          return api<VideoStatusResponse>("video/status").then((vStatus) => {
             state.videoStatus = vStatus;
             document.getElementById("ffUpdate")?.classList.add("hidden");
             return refresh();

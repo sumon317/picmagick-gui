@@ -57,11 +57,37 @@ export type SelectionCount = {
 };
 
 /** Lowercased (or unchanged) copy for path matching. */
+
+/**
+ * Full rule folding, in exact parity with `foldKey` in src/policy.ts:
+ * NFC-normalise, map the whole slash-lookalike family to "/", strip trailing
+ * slashes, and lowercase only on case-insensitive platforms. The sets passed
+ * to the matchers fold their entries the same way, so a rule written with an
+ * NFD name, a lookalike separator or a trailing slash matches the path the
+ * server will fold it against. Keeping this file a verbatim copy matters:
+ * the bundler cannot import server leaves, so drift here becomes silent
+ * render/exclude mismatches.
+ */
+const SLASH_LIKE = /[\u002F\u005C\u2044\u2215\u29F5\u29F8\uFF0F\uFF3C]/g;
+
+const fold = (s: string, caseInsensitive: boolean): string => {
+  const folded = s
+    .normalize("NFC")
+    .replace(SLASH_LIKE, "/")
+    .replace(/\/+$/, "");
+  return caseInsensitive ? folded.toLowerCase() : folded;
+};
+
+/**
+ * Fold a whole rule/path set the way the matchers fold paths, so membership
+ * tests agree with policy.ts on lookalike separators, NFC variants, and
+ * trailing slashes.
+ */
 export const excludedLower = (
   set: ReadonlySet<string>,
   caseInsensitive = true,
 ): Set<string> =>
-  new Set([...set].map((e) => caseInsensitive ? e.toLowerCase() : e));
+  new Set([...set].map((e) => fold(e, caseInsensitive)));
 
 /**
  * Path matching options supplied by the server through /api/status.
@@ -71,9 +97,6 @@ const pathOptions = (opts?: PathOptions): ResolvedPathOptions => ({
   sep: opts?.sep === "/" ? "/" : "\\",
   caseInsensitive: opts?.caseInsensitive !== false,
 });
-
-const fold = (s: string, caseInsensitive: boolean): string =>
-  caseInsensitive ? s.toLowerCase() : s;
 
 
 /**
@@ -139,7 +162,13 @@ export function isFileExcluded(
   const key = fold(rel, caseInsensitive);
   if (incFiles.has(key)) return false;
   if (exFiles.has(key)) return true;
-  return isFullyExcluded(rel, exFolders, incFolders, opts);
+  // Folder rules match the file's containing path only - never the file name
+  // itself - exactly like policy.ts under() compares against dir/rel prefixes.
+  // Cutting the last segment also stops a stale folder rule that happens to
+  // equal this file's name from swallowing the file.
+  const sepPos = Math.max(rel.lastIndexOf("/"), rel.lastIndexOf("\\"));
+  const dir = sepPos === -1 ? "" : rel.slice(0, sepPos);
+  return isFullyExcluded(dir, exFolders, incFolders, opts);
 }
 
 /**
@@ -193,11 +222,13 @@ export function clearFileOverridesUnder(
   includedFiles: ReadonlySet<string>,
   opts: PathOptions = {},
 ): FileSelection {
-  const { sep, caseInsensitive } = pathOptions(opts);
+  const { caseInsensitive } = pathOptions(opts);
   const key = fold(rel, caseInsensitive);
+  // fold() normalises every separator to "/", so subtree membership below the
+  // target is a "/"-joined prefix check - matching policy.ts under().
   const atOrBelow = (p: string): boolean => {
     const k = fold(p, caseInsensitive);
-    return k === key || k.startsWith(key + sep);
+    return k === key || k.startsWith(key + "/");
   };
   return {
     excludedFiles: new Set([...excludedFiles].filter((p) => !atOrBelow(p))),
@@ -266,19 +297,20 @@ export function toggleFolder(
 ): FolderSelection {
   const ex = new Set(excluded);
   const inc = new Set(included);
-  const { sep, caseInsensitive } = pathOptions(opts);
+  const { caseInsensitive } = pathOptions(opts);
   const key = fold(rel, caseInsensitive);
 
   // "At or below the target": the target itself, or a recorded descendant.
   // Descendants follow the target, so they are cleared in both directions.
   // Ancestors are deliberately NOT in here: excluding a child must never
-  // cancel an exclusion the user set on its parent.
+  // cancel an exclusion the user set on its parent. fold() normalises all
+  // separators to "/", the same way policy.ts compares rules to paths.
   const atOrBelow = (e: string): boolean => {
     const k = fold(e, caseInsensitive);
-    return k === key || k.startsWith(key + sep);
+    return k === key || k.startsWith(key + "/");
   };
   const ancestorExcluded = [...ex].some((e) =>
-    key.startsWith(fold(e, caseInsensitive) + sep));
+    key.startsWith(fold(e, caseInsensitive) + "/"));
 
   for (const e of [...ex]) if (atOrBelow(e)) ex.delete(e);
   for (const e of [...inc]) if (atOrBelow(e)) inc.delete(e);

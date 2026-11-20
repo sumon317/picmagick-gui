@@ -7,7 +7,7 @@ import type { FileResult } from "./convert.ts";
 import { runConversion } from "./convert.ts";
 import type { Decision, Policy } from "./policy.ts";
 import { writeManifest, listManifests, readManifest, undoManifest, type Manifest } from "./manifest.ts";
-import { applyProcessCpuLimit, acquireSleepInhibit, releaseSleepInhibit } from "./cpu.ts";
+import { applyProcessCpuLimitAsync, acquireSleepInhibit, releaseSleepInhibit } from "./cpu.ts";
 
 export type JobState = "idle" | "running" | "paused" | "done" | "cancelled" | "failed";
 
@@ -93,10 +93,13 @@ export class Job extends EventEmitter {
    */
   private liveJobs = 1;
   private getLimit = () => this.liveJobs;
+  /** Live runPool's dispatch hook; raising the limit starts new work at once. */
+  private wakeDispatch: (() => void) | null = null;
 
   /** Change concurrency on a running job. Clamped to something sane. */
   setJobs(n: number) {
     this.liveJobs = Math.max(1, Math.min(Math.round(n) || 1, 32));
+    this.wakeDispatch?.();
     return this.liveJobs;
   }
 
@@ -117,8 +120,15 @@ export class Job extends EventEmitter {
 
   setCpuLimit(n: number) {
     this.liveCpuLimit = Math.max(10, Math.min(Math.round(n) || 70, 100));
-    for (const pid of this.activePids) {
-      applyProcessCpuLimit(pid, this.liveCpuLimit);
+    const pids = [...this.activePids];
+    if (pids.length > 0) {
+      // Build every per-PID affinity update up front, then coalesce them so a
+      // slow/hung taskset on one PID never serializes the others or blocks the
+      // event loop. setCpuLimit stays synchronous because server.ts reads its
+      // numeric return immediately; the bounded waits run in the background.
+      void Promise.all(
+        pids.map((pid) => applyProcessCpuLimitAsync(pid, this.liveCpuLimit)),
+      ).catch((err) => console.warn(`[jobs] CPU limit update failed:`, err));
     }
     return this.liveCpuLimit;
   }
@@ -127,8 +137,13 @@ export class Job extends EventEmitter {
     return this.liveCpuLimit;
   }
 
+  private totalElapsedSeconds(): number {
+    const activeMs = this.state === "running" && this.started > 0 ? Date.now() - this.started : 0;
+    return (this.elapsedBeforePauseMs + activeMs) / 1000;
+  }
+
   private emitProgress(file?: FileResult, starting?: { rel: string; bytes: number }) {
-    const elapsed = (this.elapsedBeforePauseMs + (Date.now() - this.started)) / 1000;
+    const elapsed = this.totalElapsedSeconds();
     // Average service time across finished files, scaled by remaining work.
     const avg = this.done > 0 ? elapsed / this.done : 0;
     const remaining = Math.max(0, this.total - this.done);
@@ -214,24 +229,54 @@ private total = 0;
     return true;
   }
 
+  /**
+   * Write one manifest covering everything this job has put on disk so far.
+   * Returns the id (undefined when nothing landed). Entries carry
+   * converted/copied rows only, so a partial run's manifest never claims
+   * more than actually landed.
+   */
+  private async persistResultsManifest(o: StartOptions): Promise<string | undefined> {
+    if (this.results.length === 0) return undefined;
+    const id =
+      `run-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(36).slice(2, 6)}`;
+    await writeManifest(
+      o.destination,
+      id,
+      {
+        createdAt: Date.now(),
+        sourceRoot: o.sourceRoot,
+        destination: o.destination,
+        quality: o.qualityLabel,
+        heicSpeed: o.policy.heicSpeed,
+        outputFormat: o.policy.outputFormat,
+        tool: "compakta",
+      },
+      this.results,
+    );
+    return id;
+  }
+
   /** Hard stop: kills in-flight encoders. Partial outputs are cleaned up. */
-  cancel() {
+  async cancel(): Promise<boolean> {
     if (this.sleepHeld) {
       releaseSleepInhibit();
       this.sleepHeld = false;
     }
-    // A paused job has nothing in flight, so cancelling is just a state change.
-    // It still has to be handled: otherwise a paused run could never be
-    // abandoned and the UI's "Cancel instead" would silently do nothing.
+    // A paused job has nothing in flight, so cancelling is a state change —
+    // but the paused segment's finished files are already on disk and still
+    // need a manifest, or they become permanently non-undoable.
     if (this.state === "paused") {
       this.state = "cancelled";
+      const manifestId = await this.persistResultsManifest(this.opts!).catch(() => undefined);
       const finishEvt: Progress = {
         type: "finish",
         at: Date.now(),
         jobId: this.id,
-        manifestId: undefined,
+        manifestId,
         summary: this.summary(this.totals.bytes, "cancelled"),
-        message: "Paused run discarded. Completed files are on disk and will be skipped next time.",
+        message: manifestId
+          ? "Paused run discarded. Completed files are on disk (undoable) and will be skipped next time."
+          : "Paused run discarded. Completed files are on disk and will be skipped next time.",
       };
       this.lastTerminalEvent = finishEvt;
       this.emit("progress", finishEvt);
@@ -253,7 +298,7 @@ private total = 0;
       bytes,
       inBytes: this.totals.inBytes,
       remaining: this.total - this.done,
-      elapsedSeconds: Math.round((this.elapsedBeforePauseMs + (Date.now() - this.started)) / 1000),
+      elapsedSeconds: Math.round(this.totalElapsedSeconds()),
       note,
     };
   }
@@ -292,6 +337,7 @@ private total = 0;
         jobs: o.jobs,
         cpuLimit: this.liveCpuLimit,
         getLimit: this.getLimit,
+        onWake: (wake) => { this.wakeDispatch = wake; },
         getCpuLimit: this.getCpuLimit,
         onChildSpawn: (pid) => this.activePids.add(pid),
         onChildExit: (pid) => this.activePids.delete(pid),
@@ -303,10 +349,10 @@ private total = 0;
         },
         onResult: (r) => {
           this.inFlight--;
-          this.finished.add(r.rel);
-          this.totals.bytes += r.outBytes;
-          this.totals.inBytes += r.inBytes;
           if (r.status !== "cancelled") {
+            this.finished.add(r.rel);
+            this.totals.bytes += r.outBytes;
+            this.totals.inBytes += r.inBytes;
             this.done++;
             this.totals[r.status === "converted" ? "converted"
               : r.status === "copied" ? "copied"
@@ -316,10 +362,14 @@ private total = 0;
           this.emitProgress(r);
         },
       }, this.shouldStop);
+      this.wakeDispatch = null; // pool over: a later setJobs() must not wake it
 
       // A pause is not a finished run, so no manifest is written yet.
       if (this.pauseRequested && !this.controller.signal.aborted && this.done < this.total) {
-        this.elapsedBeforePauseMs += Date.now() - this.started;
+        if (this.started > 0) {
+          this.elapsedBeforePauseMs += Date.now() - this.started;
+          this.started = 0;
+        }
         this.state = "paused";
         this.results = [...this.results, ...result.results];
         this.emit("progress", {
@@ -336,39 +386,40 @@ private total = 0;
         return;
       }
 
+      if (this.started > 0) {
+        this.elapsedBeforePauseMs += Date.now() - this.started;
+        this.started = 0;
+      }
+
       const cancelled = this.controller.signal.aborted;
       this.state = cancelled ? "cancelled" : "done";
       this.results = [...this.results, ...result.results];
 
-      let manifestId: string | undefined;
-      if (!cancelled) {
-        manifestId = `run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-        await writeManifest(
-          o.destination,
-          manifestId,
-          {
-            createdAt: Date.now(),
-            sourceRoot: o.sourceRoot,
-            destination: o.destination,
-            quality: o.qualityLabel,
-            heicSpeed: o.policy.heicSpeed,
-            outputFormat: o.policy.outputFormat,
-            tool: "compakta",
-          },
-          this.results,
-        );
-      }
+      // Every file this job finished gets a manifest — including on a
+      // cancelled run, where previously the completed files were stranded in
+      // the destination with no undo record (JB-1).
+      // Same guard as the paused/cancel branch: a manifest write failure must
+      // not turn an otherwise finished job into a "failed" state + error event.
+      const manifestId = await this.persistResultsManifest(o).catch(() => undefined);
 
       const finishEvt: Progress = {
         type: "finish",
         at: Date.now(),
         jobId: this.id,
         manifestId,
-        summary: this.summary(this.totals.bytes, cancelled ? "cancelled" : undefined),
+        summary: this.summary(
+          this.totals.bytes,
+          cancelled
+            ? "cancelled"
+            : this.done > 0 && this.totals.failed === this.done
+              ? "every file failed — check the ImageMagick panel"
+              : undefined,
+        ),
       };
       this.lastTerminalEvent = finishEvt;
       this.emit("progress", finishEvt);
     } catch (err) {
+      this.wakeDispatch = null;
       this.state = "failed";
       const errEvt: Progress = {
         type: "error", at: Date.now(), jobId: this.id,

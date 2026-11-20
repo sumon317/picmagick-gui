@@ -90,6 +90,50 @@ export const debounce = <A extends unknown[]>(
   };
 };
 
+export type FrameCoalescer = {
+  /** Ask for fn to run at most once per frame; N calls collapse into one. */
+  request: () => void;
+  /** Run fn immediately (state transitions), cancelling any queued frame. */
+  flush: () => void;
+  /** True while a frame is still outstanding (probe/testing hook). */
+  pending: () => boolean;
+};
+
+/**
+ * Collapse high-frequency renders (per-file SSE progress) to at most one per
+ * animation frame. The scheduler is injectable so bun probes can drive it
+ * deterministically; browsers get requestAnimationFrame, with a setTimeout
+ * fallback for hidden windows where rAF is throttled/paused. fn is not re-entrant
+ * through request(): a flush() during a queued frame clears the queue, and the
+ * later frame callback sees queued === false and becomes a no-op.
+ */
+export function createFrameCoalescer(
+  fn: () => void,
+  schedule: (cb: () => void) => void =
+    typeof requestAnimationFrame === "function"
+      ? (cb) => void requestAnimationFrame(cb)
+      : (cb) => void setTimeout(cb, 16),
+): FrameCoalescer {
+  let queued = false;
+  const run = (): void => {
+    if (!queued) return;
+    queued = false;
+    fn();
+  };
+  return {
+    request: (): void => {
+      if (queued) return;
+      queued = true;
+      schedule(run);
+    },
+    flush: (): void => {
+      queued = false;
+      fn();
+    },
+    pending: (): boolean => queued,
+  };
+}
+
 export type ToastKind = "info" | "success" | "warning" | "danger";
 
 const toastIcon: Record<ToastKind, string> = {

@@ -28,6 +28,12 @@ export type DedupeResult = {
   duplicateBytes: number;
   hashedFiles: number;
   hashedBytes: number;
+  /** Candidates that could not be read (deleted since scan, locked, corrupt,
+   * permission). Silent drops would make "no duplicates" look complete. */
+  hashErrors: number;
+  /** Same-size candidate groups with at least one file that failed hashing —
+   * these could hide undetected duplicates, so they are reported, not dropped. */
+  unhashedGroups: number;
   durationMs: number;
   truncated: boolean;
   candidateCount: number;
@@ -36,14 +42,16 @@ export type DedupeResult = {
 const CHUNK_BYTES = 64 * 1024;
 const PARTIAL_THRESHOLD = CHUNK_BYTES * 4; // 256 KB
 
-async function partialHashFile(abs: string, size: number): Promise<string> {
-  if (size <= PARTIAL_THRESHOLD) return fullHashFile(abs);
+async function partialHashFile(abs: string, size: number, signal?: AbortSignal): Promise<string> {
+  if (signal?.aborted) throw new Error("aborted");
+  if (size <= PARTIAL_THRESHOLD) return fullHashFile(abs, signal);
   const fh = await open(abs, "r");
   try {
     const buf = Buffer.allocUnsafe(CHUNK_BYTES);
     const h = createHash("md5");
     const offsets = [0, Math.floor(size / 2) - Math.floor(CHUNK_BYTES / 2), size - CHUNK_BYTES];
     for (const offset of offsets) {
+      if (signal?.aborted) throw new Error("aborted");
       const { bytesRead } = await fh.read(buf, 0, CHUNK_BYTES, Math.max(0, offset));
       h.update(buf.subarray(0, bytesRead));
     }
@@ -53,19 +61,27 @@ async function partialHashFile(abs: string, size: number): Promise<string> {
   }
 }
 
-function fullHashFile(abs: string): Promise<string> {
+function fullHashFile(abs: string, signal?: AbortSignal): Promise<string> {
   return new Promise((resolve, reject) => {
+    if (signal?.aborted) return reject(new Error("aborted"));
     const h = createHash("md5");
-    const s = createReadStream(abs);
+    const s = createReadStream(abs, { highWaterMark: 256 * 1024 });
+    const onAbort = () => { s.destroy(new Error("aborted")); };
+    signal?.addEventListener("abort", onAbort, { once: true });
     s.on("data", (c) => h.update(c));
-    s.on("error", reject);
-    s.on("end", () => resolve(h.digest("hex")));
+    s.on("error", (err) => { signal?.removeEventListener("abort", onAbort); reject(err); });
+    s.on("end", () => { signal?.removeEventListener("abort", onAbort); resolve(h.digest("hex")); });
   });
 }
 
 /** Cheap pre-pass: only files sharing a byte size can possibly collide. */
 export function candidatesBySize(files: ScannedFile[], policy: Policy): ScannedFile[] {
   const out: ScannedFile[] = [];
+  for (const group of candidateGroupsBySize(files, policy)) out.push(...group);
+  return out;
+}
+
+function candidateGroupsBySize(files: ScannedFile[], policy: Policy): ScannedFile[][] {
   const bySize = new Map<number, ScannedFile[]>();
   for (const f of files) {
     if (classify(f, policy).verdict === "skip") continue;
@@ -74,8 +90,9 @@ export function candidatesBySize(files: ScannedFile[], policy: Policy): ScannedF
     if (arr) arr.push(f);
     else bySize.set(f.size, [f]);
   }
-  for (const [, arr] of bySize) if (arr.length > 1) out.push(...arr);
-  return out;
+  const groups: ScannedFile[][] = [];
+  for (const arr of bySize.values()) if (arr.length > 1) groups.push(arr);
+  return groups;
 }
 
 export async function findDuplicates(
@@ -85,12 +102,24 @@ export async function findDuplicates(
 ): Promise<DedupeResult> {
   const started = Date.now();
   const maxHash = opts.maxHash ?? 40_000;
-  const allCands = candidatesBySize(files, policy);
-  const truncated = allCands.length > maxHash;
-  const cands = allCands.slice(0, maxHash);
+  const groupsBySize = candidateGroupsBySize(files, policy);
+  const totalCandidates = groupsBySize.reduce((sum, g) => sum + g.length, 0);
+  // Keep whole same-size groups together so a duplicate pair is never split
+  // across the maxHash cap.
+  const cands: ScannedFile[] = [];
+  for (const group of groupsBySize) {
+    if (cands.length > 0 && cands.length + group.length > maxHash) break;
+    cands.push(...group);
+    if (cands.length >= maxHash) break;
+  }
+  const truncated = cands.length < totalCandidates;
 
   const CONC = 8;
   const partialGroups = new Map<string, ScannedFile[]>();
+  let hashErrors = 0;
+  // D-2: track exactly which candidates failed hashing so we can derive a real
+  // count of unverified same-size groups instead of fabricating a number.
+  const failedHashAbs = new Set<string>();
   let cursor = 0;
 
   // Stage 1: Fast partial fingerprint (or full hash if <= 256 KB)
@@ -100,12 +129,19 @@ export async function findDuplicates(
         if (opts.signal?.aborted) return;
         const f = cands[cursor++];
         try {
-          const pHash = await partialHashFile(f.abs, f.size);
+          const pHash = await partialHashFile(f.abs, f.size, opts.signal);
           const key = `${f.size}:${pHash}`;
           const arr = partialGroups.get(key);
           if (arr) arr.push(f);
           else partialGroups.set(key, [f]);
         } catch {
+          // A read failure is a real error unless the user aborted mid-hash -
+          // abort tears (ENOENT/EBADF from a killed read) are not user-visible
+          // problems and must not be counted.
+          if (!opts.signal?.aborted) {
+            hashErrors++;
+            failedHashAbs.add(f.abs);
+          }
           continue;
         }
       }
@@ -138,7 +174,7 @@ export async function findDuplicates(
         if (opts.signal?.aborted) return;
         const f = needFullHash[fullCursor++];
         try {
-          const hash = await fullHashFile(f.abs);
+          const hash = await fullHashFile(f.abs, opts.signal);
           hashedFiles++;
           hashedBytes += f.size;
           const arr = hashes.get(hash);
@@ -146,6 +182,10 @@ export async function findDuplicates(
           else hashes.set(hash, [f]);
           opts.onProgress?.(hashedFiles, needFullHash.length);
         } catch {
+          if (!opts.signal?.aborted) {
+            hashErrors++;
+            failedHashAbs.add(f.abs);
+          }
           continue;
         }
       }
@@ -178,14 +218,26 @@ export async function findDuplicates(
 
   groups.sort((a, b) => b.size * (b.members.length - 1) - a.size * (a.members.length - 1));
 
+  // D-2: a same-size candidate bucket that lost a file to a hash error is not
+  // a trustworthy "no duplicates here" result — it may hide a duplicate pair.
+  // Count those buckets from the recorded failures (never fabricate a value).
+  let unhashedGroups = 0;
+  if (failedHashAbs.size > 0) {
+    for (const members of groupsBySize) {
+      if (members.some((m) => failedHashAbs.has(m.abs))) unhashedGroups++;
+    }
+  }
+
   return {
     groups,
     duplicateFiles,
     duplicateBytes,
     hashedFiles,
     hashedBytes,
+    hashErrors,
+    unhashedGroups,
     durationMs: Date.now() - started,
     truncated,
-    candidateCount: allCands.length,
+    candidateCount: totalCandidates,
   };
 }

@@ -2,10 +2,10 @@
  * Locating ImageMagick, probing its capabilities, and enforcing the safety
  * invariants that keep this tool from ever touching the originals.
  */
-import { existsSync, readFileSync, readdirSync, type Dirent } from "node:fs";
+import { existsSync, readFileSync, readdirSync, realpathSync, type Dirent } from "node:fs";
 import { stat } from "node:fs/promises";
 import path from "node:path";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { homedir } from "node:os";
 import { IS_LINUX, IS_WINDOWS, MAGICK_BIN, pathKey } from "./platform.ts";
 import { compareVersions, parseVersion } from "./version.ts";
@@ -73,7 +73,16 @@ export function parseFormatSupport(text: string): Record<OutputFormat, FormatSup
       .find((l) => new RegExp(`^\\s*${name}\\*?\\s+`).test(l))
       ?.trim();
 
-    const mode = line?.split(/\s+/)[1] ?? "";
+    const tokens = line?.split(/\s+/) ?? [];
+    // Static builds print "AVIF* rw+ ..."; modular Linux builds include a
+    // middle Module column: "AVIF  HEIC  rw+ ...". Pick whichever token is the
+    // 3-char rw+/- mode flag.
+    const modeRe = /^[r-][w-][+-]$/;
+    const mode =
+      (tokens[1] && modeRe.test(tokens[1]) ? tokens[1] : null) ??
+      (tokens[2] && modeRe.test(tokens[2]) ? tokens[2] : null) ??
+      tokens[1] ??
+      "";
     // Some rows have more than one parenthetical group. The delegate/version
     // is the last one: "JPEG XL (ISO/IEC 18181) (libjxl 0.12.0)".
     const details = [...(line ?? "").matchAll(/\(([^)]+)\)/g)];
@@ -83,11 +92,6 @@ export function parseFormatSupport(text: string): Record<OutputFormat, FormatSup
 
   return out;
 }
-
-/** Directories that hold no convertible payload - never worth showing as a cost. */
-export const JUNK_EXTS = [
-  "pcv", "tmp", "appimage", "exe", "url", "lnk", "ini", "db", "sqlite", "thumbs", "db-wal",
-] as const;
 
 /** Where the app keeps (or downloads) its own portable ImageMagick. */
 export const LOCAL_MAGICK_ROOT = MAGICK_DIR;
@@ -225,15 +229,22 @@ function candidateMagickPaths(): string[] {
         }
       }
     }
-    // 4. Standard install locations.
+    // 4. Standard install locations (newest version first).
     const pf = process.env["ProgramFiles"];
     const pfx = process.env["ProgramFiles(x86)"];
+    const installedDirs: string[] = [];
     for (const root of [pf, pfx]) {
       if (!root) continue;
       for (const name of readdirSafe(root)) {
-        if (/^ImageMagick-7\./i.test(name)) out.push(path.join(root, name, MAGICK_BIN));
+        if (/^ImageMagick-7\./i.test(name)) installedDirs.push(path.join(root, name, MAGICK_BIN));
       }
     }
+    installedDirs.sort((a, b) => {
+      const an = path.basename(path.dirname(a));
+      const bn = path.basename(path.dirname(b));
+      return compareVersions(bn, an) || bn.localeCompare(an);
+    });
+    out.push(...installedDirs);
     // 5. Whatever is on PATH.
     out.push(MAGICK_BIN);
     out.push("magick");
@@ -251,7 +262,15 @@ function candidateMagickPaths(): string[] {
     // 3. Whatever is on PATH.
     out.push(MAGICK_BIN);
   } else {
-    // Unsupported platform: PATH is the only sensible guess.
+    // macOS: Homebrew (Apple Silicon / Intel) and MacPorts install locations,
+    // then whatever is on PATH.
+    for (const dir of [
+      "/opt/homebrew/bin",
+      "/usr/local/bin",
+      "/opt/local/bin",
+    ]) {
+      out.push(path.join(dir, MAGICK_BIN));
+    }
     out.push(MAGICK_BIN);
     out.push("magick");
   }
@@ -338,25 +357,51 @@ export function findMagick(force = false): MagickInfo {
 }
 
 /**
+ * Resolve symlinks on the deepest existing ancestor of `p`, re-attaching any
+ * not-yet-created trailing path segments. Prevents symlink/junction bypasses
+ * when checking destination containment.
+ */
+function resolveRealPath(p: string): string {
+  const abs = path.resolve(p);
+  const tail: string[] = [];
+  let cur = abs;
+  while (true) {
+    try {
+      const real = realpathSync(cur);
+      return tail.length ? path.join(real, ...tail.reverse()) : real;
+    } catch {
+      const parent = path.dirname(cur);
+      if (parent === cur) return abs;
+      tail.push(path.basename(cur));
+      cur = parent;
+    }
+  }
+}
+
+/**
  * Hard invariant #2: the output tree must never live inside the source tree,
  * or the mirror would recurse into its own output forever.
  */
 export function assertDestinationSafe(source: string, destination: string): void {
-  const src = pathKey(path.resolve(source));
-  const dst = pathKey(path.resolve(destination));
-
-  if (!path.isAbsolute(dst)) {
+  if (!destination || !path.isAbsolute(destination)) {
     throw new Error(`Destination must be an absolute path, got: ${destination}`);
   }
-  if (dst === src) {
-    throw new Error("Destination cannot be the source folder.");
-  }
-  const prefix = src.endsWith(path.sep) ? src : src + path.sep;
-  if (dst.startsWith(prefix)) {
-    throw new Error(
-      `Destination "${destination}" is inside the source folder "${source}".\n` +
-        `Choose a sibling folder instead, e.g. ${IS_WINDOWS ? "D:\\Photos-avif" : `${source}-avif`}`,
-    );
+  const pairs: Array<[string, string]> = [
+    [pathKey(path.resolve(source)), pathKey(path.resolve(destination))],
+    [pathKey(resolveRealPath(source)), pathKey(resolveRealPath(destination))],
+  ];
+
+  for (const [src, dst] of pairs) {
+    if (dst === src) {
+      throw new Error("Destination cannot be the source folder.");
+    }
+    const prefix = src.endsWith(path.sep) ? src : src + path.sep;
+    if (dst.startsWith(prefix)) {
+      throw new Error(
+        `Destination "${destination}" is inside the source folder "${source}".\n` +
+          `Choose a sibling folder instead, e.g. ${IS_WINDOWS ? "D:\\Photos-avif" : `${source}-avif`}`,
+      );
+    }
   }
 }
 
@@ -383,20 +428,31 @@ export async function freeSpace(p: string): Promise<number | null> {
 
   if (!IS_WINDOWS) return null;
 
-  try {
-    const root = path.parse(path.resolve(p)).root;
-    if (!root) return null;
-    const ps = `(Get-PSDrive -Name '${root.replace(/[:\\]/g, "")}').Free`;
-    const out = execFileSync(
+  const root = path.parse(path.resolve(p)).root;
+  const drive = root.replace(/[:\\]/g, "");
+  if (!/^[A-Za-z]$/.test(drive)) return null;
+
+  return new Promise<number | null>((resolve) => {
+    const ps = `(Get-PSDrive -Name '${drive}').Free`;
+    const child = spawn(
       "powershell.exe",
       ["-NoProfile", "-NonInteractive", "-Command", ps],
-      { encoding: "utf8", timeout: 20_000, windowsHide: true },
+      { stdio: ["ignore", "pipe", "ignore"], windowsHide: true },
     );
-    const n = Number(out.trim());
-    return Number.isFinite(n) ? n : null;
-  } catch {
-    return null;
-  }
+    let out = "";
+    const timer = setTimeout(() => {
+      try { child.kill(); } catch { /* gone */ }
+      resolve(null);
+    }, 20_000);
+    child.stdout.on("data", (d) => { if (out.length < 256) out += String(d); });
+    child.on("error", () => { clearTimeout(timer); resolve(null); });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      if (code !== 0) return resolve(null);
+      const n = Number(out.trim());
+      resolve(Number.isFinite(n) ? n : null);
+    });
+  });
 }
 
 export async function ensureDir(p: string): Promise<void> {

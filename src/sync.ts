@@ -226,6 +226,7 @@ export async function cleanOrphans(
   const { rm, rmdir } = await import("node:fs/promises");
   const resolvedDest = path.resolve(destination);
   const destRoot = pathKey(resolvedDest);
+  const destPrefix = destRoot.endsWith(path.sep) ? destRoot : destRoot + path.sep;
   const res: CleanOrphansResult = { removed: 0, bytesFreed: 0, refused: 0, errors: [] };
   const candidateDirs = new Set<string>();
 
@@ -233,7 +234,7 @@ export async function cleanOrphans(
     const target = path.resolve(item.out);
     const base = path.basename(target);
     if (
-      !pathKey(target).startsWith(destRoot + path.sep) ||
+      !pathKey(target).startsWith(destPrefix) ||
       base.startsWith(".compakta-manifest-") ||
       base.startsWith(".picmagic-manifest-")
     ) {
@@ -245,7 +246,7 @@ export async function cleanOrphans(
       res.removed++;
       res.bytesFreed += item.bytes;
       let dir = path.dirname(target);
-      while (pathKey(dir).startsWith(destRoot + path.sep)) {
+      while (pathKey(dir).startsWith(destPrefix)) {
         candidateDirs.add(dir);
         dir = path.dirname(dir);
       }

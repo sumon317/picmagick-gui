@@ -66,10 +66,14 @@ export type ScanResult = {
   skipped: { path: string; reason: string }[];
 };
 
+const CONVERT_EXT_SET = new Set<string>(CONVERT_EXTS);
+const RAW_EXT_SET = new Set<string>(RAW_EXTS);
+const VIDEO_EXT_SET = new Set<string>(VIDEO_EXTS);
+
 function categorise(ext: string): Category {
-  if ((CONVERT_EXTS as readonly string[]).includes(ext)) return "image";
-  if ((RAW_EXTS as readonly string[]).includes(ext)) return "raw";
-  if ((VIDEO_EXTS as readonly string[]).includes(ext)) return "video";
+  if (CONVERT_EXT_SET.has(ext)) return "image";
+  if (RAW_EXT_SET.has(ext)) return "raw";
+  if (VIDEO_EXT_SET.has(ext)) return "video";
   return "other";
 }
 
@@ -144,7 +148,12 @@ export async function scanLibrary(
   const STAT_CONCURRENCY = 24;
 
   async function walk(dirAbs: string, node: TreeNode, depth: number): Promise<void> {
-    if (depth > maxDepth) return;
+    // Record the cut instead of dropping the folder silently: "my folder is
+    // missing" and "folder is beyond maxDepth" are different user problems.
+    if (depth > maxDepth) {
+      skipped.push({ path: dirAbs, reason: "max-depth cut" });
+      return;
+    }
 
     let entries;
     try {
@@ -167,7 +176,10 @@ export async function scanLibrary(
       }
 
       if (entry.isDirectory()) {
-        if (isIgnoredDir(name)) continue;
+        if (isIgnoredDir(name)) {
+          skipped.push({ path: childAbs, reason: `ignored-pattern: ${name}` });
+          continue;
+        }
         const relChild = path.relative(absRoot, childAbs);
         const child = blankNode(name, relChild, childAbs, depth + 1);
         node.children.push(child);
@@ -217,7 +229,7 @@ export async function scanLibrary(
     }
   }
 
-  const rootNode = blankNode(path.basename(absRoot), "", absRoot, 0);
+  const rootNode = blankNode(path.basename(absRoot) || absRoot, "", absRoot, 0);
   await walk(absRoot, rootNode, 0);
   rollup(rootNode);
 

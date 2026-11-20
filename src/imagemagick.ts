@@ -10,14 +10,14 @@
  * fetched. No URL from the browser is trusted, and nothing outside
  * `imagemagick/` is written to.
  */
-import { execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
 import { createReadStream, existsSync } from "node:fs";
-import { chmod, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises";
+import { chmod, mkdir, readFile, readdir, rename, rm, stat, writeFile } from "node:fs/promises";
 import path from "node:path";
 
 import { IS_LINUX, IS_WINDOWS, pathKey } from "./platform.ts";
-import { findMagick, invalidateMagickCache, runMagickFile, type MagickInfo } from "./paths.ts";
+import { findMagick, invalidateMagickCache, parseFormatSupport, type MagickInfo } from "./paths.ts";
 import { compareVersions, isNewerVersion, parseVersion } from "./version.ts";
 import { MAGICK_DIR, BUNDLED_MAGICK_DIR } from "./appdirs.ts";
 
@@ -95,9 +95,16 @@ export type InstallResult = {
   folder: string;
   bytes: number;
   replaced: boolean;
+  /**
+   * Present when the release metadata carried no usable SHA-256 digest, so
+   * integrity could NOT be verified (shown in the UI); null when verified or
+   * when no download happened.
+   */
+  integrityNote: string | null;
 };
 
-const port = (arch: string) => (arch === "arm64" ? "arm64" : "x64");
+const port = (arch: string): "arm64" | "x64" | null =>
+  arch === "arm64" ? "arm64" : arch === "x64" ? "x64" : null;
 
 let cached: { at: number; release: LatestRelease } | null = null;
 
@@ -112,6 +119,14 @@ let progress: InstallProgress = {
 
 export function installProgress(): InstallProgress {
   return { ...progress };
+}
+
+/**
+ * Cheap boolean for other modules (server routes) that must refuse work —
+ * e.g. return HTTP 409 — while an ImageMagick download/extract/swap is running.
+ */
+export function isInstallInProgress(): boolean {
+  return progress.running;
 }
 
 /** True only for HTTPS URLs inside ImageMagick's own release downloads. */
@@ -129,13 +144,35 @@ export function isTrustedReleaseUrl(raw: string): boolean {
 }
 
 /**
+ * Human message for failed release checks. The two throttled statuses get a
+ * friendly explanation with the reset time when GitHub provides one; the raw
+ * line is kept for everything else.
+ */
+export function rateLimitMessage(status: number, statusText: string, headers: Headers): string {
+  if (status !== 403 && status !== 429) {
+    return `GitHub release check failed: HTTP ${status} ${statusText}.`;
+  }
+  const reset = Number(headers.get("x-ratelimit-reset"));
+  let when = "";
+  if (Number.isFinite(reset) && reset > 0) {
+    const minutes = Math.max(1, Math.ceil((reset * 1000 - Date.now()) / 60_000));
+    when = ` The limit resets in about ${minutes} minute${minutes === 1 ? "" : "s"}.`;
+  }
+  const tokenHint = process.env.GITHUB_TOKEN
+    ? ""
+    : " Setting a GITHUB_TOKEN environment variable raises this limit.";
+  return `GitHub is rate-limiting release checks from this network (HTTP ${status}). Try again in a few minutes.${when}${tokenHint}`;
+}
+
+/**
  * Pick the portable Q16 archive for this CPU. The HDRI variant is deliberately
  * excluded: it ends in `portable-Q16-HDRI-x64.7z`, not the suffix we match.
  */
 export function pickPortableAsset(
   assets: Array<{ name?: unknown; size?: unknown; browser_download_url?: unknown; digest?: unknown }>,
-  arch = port(process.arch),
+  arch: string | null = port(process.arch),
 ): PortableAsset | null {
+  if (!arch) return null;
   const suffix = `-portable-Q16-${arch}.7z`;
   for (const a of assets) {
     if (typeof a.name !== "string" || typeof a.browser_download_url !== "string") continue;
@@ -151,30 +188,40 @@ export function pickPortableAsset(
 }
 
 /**
- * Official Linux AppImages are x86_64 only. The gcc build has the widest glibc
- * compatibility; clang is a fallback for releases that lack it.
+ * Official Linux AppImages are x86_64 only. Preference order: the gcc build
+ * (widest glibc compatibility), then clang, then any bare x86_64 AppImage —
+ * recent releases (7.1.2-36+) ship only the bare name, so it must be accepted.
  */
+const APPIMAGE_TOOLCHAIN_TIERS: RegExp[] = [
+  /^ImageMagick-.+-gcc-x86_64\.AppImage$/,
+  /^ImageMagick-.+-clang-x86_64\.AppImage$/,
+  /^ImageMagick-.+-x86_64\.AppImage$/,
+];
+
 export function pickAppImageAsset(
   assets: Array<{ name?: unknown; size?: unknown; browser_download_url?: unknown; digest?: unknown }>,
   arch = process.arch,
 ): PortableAsset | null {
   if (arch !== "x64") return null;
+  // Bare-name gate is a superset of both toolchain names; exact precedence is
+  // applied by the tiers below.
   const candidates = assets.filter(
     (a): a is { name: string; size?: unknown; browser_download_url: string; digest?: unknown } =>
       typeof a.name === "string" &&
       typeof a.browser_download_url === "string" &&
-      /^ImageMagick-.+-(gcc|clang)-x86_64\.AppImage$/.test(a.name),
+      /^ImageMagick-.+-x86_64\.AppImage$/.test(a.name),
   );
-  const chosen =
-    candidates.find((a) => /-gcc-x86_64\.AppImage$/.test(a.name)) ??
-    candidates.find((a) => /-clang-x86_64\.AppImage$/.test(a.name));
-  if (!chosen) return null;
-  return {
-    name: chosen.name,
-    size: Number(chosen.size) || 0,
-    url: chosen.browser_download_url,
-    digest: typeof chosen.digest === "string" ? chosen.digest : null,
-  };
+  for (const tier of APPIMAGE_TOOLCHAIN_TIERS) {
+    const chosen = candidates.find((a) => tier.test(a.name));
+    if (!chosen) continue;
+    return {
+      name: chosen.name,
+      size: Number(chosen.size) || 0,
+      url: chosen.browser_download_url,
+      digest: typeof chosen.digest === "string" ? chosen.digest : null,
+    };
+  }
+  return null;
 }
 
 function pickReleaseAsset(
@@ -193,8 +240,78 @@ function errorText(err: unknown): string {
   return message.replace(/\s+/g, " ").trim().slice(0, 300);
 }
 
-/** Ask GitHub for the latest release. Cached for 10 minutes unless forced. */
-export async function fetchLatestRelease(force = false): Promise<LatestRelease> {
+/**
+ * Promisified spawn with timeout and captured stdout/stderr.
+ *
+ * The install path used to run these children with execFileSync, which froze
+ * the event loop (progress polling included) for up to ~90 s per stage; this
+ * keeps the server responsive during extraction and verification. The child
+ * is killed when the timeout fires, and stderr is surfaced for error text.
+ */
+function runCapture(
+  cmd: string,
+  args: string[],
+  opts: { timeoutMs: number; maxBuffer?: number; env?: NodeJS.ProcessEnv },
+): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const cap = opts.maxBuffer ?? 8 * 1024 * 1024;
+    const child = spawn(cmd, args, {
+      windowsHide: true,
+      env: opts.env ? { ...process.env, ...opts.env } : process.env,
+    });
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { child.kill("SIGKILL"); } catch { /* exiting anyway */ }
+      reject(new Error(`${path.basename(cmd)} timed out after ${Math.round(opts.timeoutMs / 1000)} s.`));
+    }, opts.timeoutMs);
+    child.stdout?.on("data", (d: Buffer) => {
+      if (stdout.length < cap) stdout += String(d);
+    });
+    child.stderr?.on("data", (d: Buffer) => {
+      if (stderr.length < cap) stderr += String(d);
+    });
+    child.on("error", (err) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(err);
+    });
+    child.on("close", (code) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (code === 0) {
+        resolve(stdout);
+        return;
+      }
+      const detail = stderr.trim() || stdout.trim() || `exit code ${code ?? "signal"}`;
+      reject(new Error(`${path.basename(cmd)} failed: ${detail.slice(0, 400)}`));
+    });
+  });
+}
+
+/**
+ * Ask GitHub for the latest release. Cached for 10 minutes unless forced.
+ * A refresh already in flight is shared by every caller — forced or not —
+ * so two tabs or a modal-refresh racing an install click cannot issue
+ * duplicate API calls (anon quota is only 60/h per network).
+ */
+let inflightRelease: Promise<LatestRelease> | null = null;
+
+export function fetchLatestRelease(force = false): Promise<LatestRelease> {
+  if (inflightRelease) return inflightRelease;
+  const run = doFetchLatestRelease(force).finally(() => {
+    if (inflightRelease === run) inflightRelease = null;
+  });
+  inflightRelease = run;
+  return run;
+}
+
+async function doFetchLatestRelease(force = false): Promise<LatestRelease> {
   if (!force && cached && Date.now() - cached.at < CACHE_MS) return cached.release;
 
   const headers: Record<string, string> = {
@@ -216,7 +333,7 @@ export async function fetchLatestRelease(force = false): Promise<LatestRelease> 
   }
 
   if (!res.ok) {
-    throw new Error(`GitHub release check failed: HTTP ${res.status} ${res.statusText}.`);
+    throw new Error(rateLimitMessage(res.status, res.statusText, res.headers));
   }
 
   let data: {
@@ -251,7 +368,9 @@ export async function fetchLatestRelease(force = false): Promise<LatestRelease> 
       }
       throw new Error(`Release ${version} has no official x86_64 AppImage asset.`);
     }
-    throw new Error(`Release ${version} has no portable Q16 build for this CPU (${port(process.arch)}).`);
+    throw new Error(
+      `Release ${version} has no portable Q16 build for this CPU (${port(process.arch) ?? process.arch}).`,
+    );
   }
   const { asset, kind } = picked;
   if (!isTrustedReleaseUrl(asset.url)) {
@@ -302,7 +421,7 @@ export async function checkForUpdate(opts: {
       }
     : null;
   const managed = isManagedInstall(installed?.path);
-  const supported = IS_WINDOWS || (IS_LINUX && process.arch === "x64");
+  const supported = (IS_WINDOWS && port(process.arch) !== null) || (IS_LINUX && process.arch === "x64");
 
   if (!supported) {
     return {
@@ -376,6 +495,12 @@ export async function checkForUpdate(opts: {
  */
 export async function installLatest(): Promise<InstallResult> {
   if (progress.running) throw new Error("An ImageMagick download is already in progress.");
+  // Finish the crash sweep before either install flow starts. The helper is
+  // best-effort (1 h age guard, never throws), but awaiting it makes the
+  // ordering deterministic; the catch is a defensive guard for future edits.
+  await sweepCrashLeftovers().catch((err) => {
+    console.warn("ImageMagick crash-leftover sweep failed:", err);
+  });
   if (IS_LINUX) return installLatestAppImage();
   if (!IS_WINDOWS) {
     throw new Error("Automatic ImageMagick installs are only supported on Windows and x86_64 Linux.");
@@ -395,8 +520,12 @@ export async function installLatest(): Promise<InstallResult> {
   let release: LatestRelease;
   let arch: string;
   try {
+    const detectedArch = port(process.arch);
+    if (!detectedArch) {
+      throw new Error(`Automatic portable installs are only supported on x64 and arm64 Windows, not ${process.arch}.`);
+    }
+    arch = detectedArch;
     release = await fetchLatestRelease(true);
-    arch = port(process.arch);
     if (!isTrustedReleaseUrl(release.asset.url)) {
       throw new Error("Refusing to download ImageMagick from an untrusted URL.");
     }
@@ -424,7 +553,7 @@ export async function installLatest(): Promise<InstallResult> {
   if (existsSync(existingExe)) {
     let usable = false;
     try {
-      verifyStagedMagick(existingExe, release.version);
+      await verifyStagedMagick(existingExe, release.version);
       usable = true;
     } catch {
       // Not a usable build. Continue and replace it after downloading.
@@ -449,6 +578,7 @@ export async function installLatest(): Promise<InstallResult> {
         folder: finalDir,
         bytes: 0,
         replaced: false,
+        integrityNote: null,
       };
     }
   }
@@ -476,10 +606,12 @@ export async function installLatest(): Promise<InstallResult> {
     });
 
     progress = { ...progress, stage: "verifying", message: "Checking the download…", percent: 100 };
-    const expectedDigest = sha256Digest(release.asset.digest);
-    if (release.asset.digest && !expectedDigest) {
-      console.warn(`Ignoring unsupported GitHub digest format for ${archive}.`);
+    const integrityNote = integrityNoteFor(release.asset.digest);
+    if (integrityNote) {
+      // Never a silent skip: warn AND carry the note in result + progress.
+      console.warn(`ImageMagick install: ${integrityNote}`);
     }
+    const expectedDigest = sha256Digest(release.asset.digest);
     if (expectedDigest) {
       const actual = await sha256File(archive);
       if (actual !== expectedDigest) {
@@ -488,11 +620,11 @@ export async function installLatest(): Promise<InstallResult> {
     }
 
     progress = { ...progress, stage: "extracting", message: "Extracting the portable build…", percent: 100 };
-    extractArchive(archive, staging);
+    await extractArchive(archive, staging);
 
     const extractedRoot = await findExtractedRoot(staging);
     progress = { ...progress, stage: "verifying", message: "Verifying magick.exe and AVIF support…" };
-    verifyStagedMagick(path.join(extractedRoot, "magick.exe"), release.version);
+    await verifyStagedMagick(path.join(extractedRoot, "magick.exe"), release.version);
 
     progress = { ...progress, stage: "installing", message: `Installing into imagemagick\\${folderName}…` };
     const backup = await swapIntoPlace(extractedRoot, finalDir);
@@ -503,7 +635,6 @@ export async function installLatest(): Promise<InstallResult> {
     } catch (err) {
       // The build is usable even if the pointer file cannot be written; the
       // versioned folder is still discovered by name.
-      if (backup) await rm(backup, { recursive: true, force: true }).catch(() => {});
       console.warn(`ImageMagick installed, but its pointer file was not written: ${errorText(err)}`);
     }
 
@@ -514,7 +645,7 @@ export async function installLatest(): Promise<InstallResult> {
     progress = {
       running: false,
       stage: "done",
-      message: `ImageMagick ${release.version} installed.`,
+      message: `ImageMagick ${release.version} installed.${integrityNote ? ` ${integrityNote}` : ""}`,
       percent: 100,
       version: release.version,
       error: null,
@@ -525,6 +656,7 @@ export async function installLatest(): Promise<InstallResult> {
       folder: finalDir,
       bytes,
       replaced: Boolean(backup),
+      integrityNote,
     };
   } catch (err) {
     const message = errorText(err);
@@ -589,19 +721,54 @@ function sha256Digest(digest: string | null): string | null {
   return match ? match[1].toLowerCase() : null;
 }
 
+/**
+ * A missing or unparseable release digest must never be a silent skip: the
+ * installed bytes would not be verifiable, so the caller (`InstallResult`
+ * and the done progress message) surfaces this to the user.
+ */
+function integrityNoteFor(assetDigest: string | null): string | null {
+  if (!assetDigest) {
+    return "Release metadata carried no SHA-256 digest — integrity not verified.";
+  }
+  if (!sha256Digest(assetDigest)) {
+    return `Release digest format not recognised (${assetDigest.trim().slice(0, 24)}…) — integrity not verified.`;
+  }
+  return null;
+}
+
 async function sha256File(file: string): Promise<string> {
   const hash = createHash("sha256");
   for await (const chunk of createReadStream(file)) hash.update(chunk);
   return hash.digest("hex");
 }
 
-/** Run the downloaded AppImage before trusting it. */
-function verifyAppImage(file: string, expected: string): void {
+/**
+ * Run the downloaded AppImage before trusting it. Async (event loop stays
+ * free); replicates paths.runMagickFile's FUSE fallback: on Linux systems
+ * without FUSE, retry once with APPIMAGE_EXTRACT_AND_RUN=1, and keep the
+ * flag set for later children on success — same semantics as upstream.
+ */
+async function verifyAppImage(file: string, expected: string): Promise<void> {
+  const isAppImage = /\.appimage$/i.test(file);
+  const run = async (args: string[], timeoutMs: number): Promise<string> => {
+    try {
+      return await runCapture(file, args, { timeoutMs });
+    } catch (err) {
+      if (!isAppImage || process.env.APPIMAGE_EXTRACT_AND_RUN === "1") throw err;
+      const out = await runCapture(file, args, {
+        timeoutMs,
+        env: { APPIMAGE_EXTRACT_AND_RUN: "1" },
+      });
+      process.env.APPIMAGE_EXTRACT_AND_RUN = "1";
+      return out;
+    }
+  };
+
   let versionOut: string;
   let formats: string;
   try {
-    versionOut = runMagickFile(file, ["-version"], 60_000);
-    formats = runMagickFile(file, ["-list", "format"], 120_000);
+    versionOut = await run(["-version"], 60_000);
+    formats = await run(["-list", "format"], 120_000);
   } catch (err) {
     throw new Error(`The downloaded AppImage did not run (${errorText(err)}).`);
   }
@@ -612,10 +779,9 @@ function verifyAppImage(file: string, expected: string): void {
     throw new Error(`Downloaded AppImage reports "${reported.trim()}", expected ${expected}.`);
   }
 
-  const avifLine = formats.split(/\r?\n/).find((l) => /^\s*AVIF\s/.test(l));
-  const mode = avifLine?.trim().split(/\s+/)[1] ?? "";
-  if (!/w/.test(mode)) {
-    throw new Error(`The downloaded AppImage cannot write AVIF (AVIF mode "${mode || "missing"}).`);
+  const avif = parseFormatSupport(formats).avif;
+  if (!avif.writable) {
+    throw new Error(`The downloaded AppImage cannot write AVIF (AVIF mode "${avif.mode || "missing"}").`);
   }
 }
 
@@ -694,7 +860,7 @@ async function installLatestAppImage(): Promise<InstallResult> {
     if (existsSync(finalFile)) {
       let usable = false;
       try {
-        verifyAppImage(finalFile, release.version);
+        await verifyAppImage(finalFile, release.version);
         usable = true;
       } catch {
         // Invalid or partial file: replace it after downloading.
@@ -720,6 +886,7 @@ async function installLatestAppImage(): Promise<InstallResult> {
           folder: IMAGEMAGICK_ROOT,
           bytes: 0,
           replaced: false,
+          integrityNote: null,
         };
       }
     }
@@ -746,10 +913,12 @@ async function installLatestAppImage(): Promise<InstallResult> {
     });
 
     progress = { ...progress, stage: "verifying", message: "Checking the download…", percent: 100 };
-    const expectedDigest = sha256Digest(release.asset.digest);
-    if (release.asset.digest && !expectedDigest) {
-      console.warn(`Ignoring unsupported GitHub digest format for ${fileName}.`);
+    const integrityNote = integrityNoteFor(release.asset.digest);
+    if (integrityNote) {
+      // Never a silent skip: warn AND carry the note in result + progress.
+      console.warn(`ImageMagick install: ${integrityNote}`);
     }
+    const expectedDigest = sha256Digest(release.asset.digest);
     if (expectedDigest) {
       const actual = await sha256File(temp);
       if (actual !== expectedDigest) {
@@ -759,7 +928,7 @@ async function installLatestAppImage(): Promise<InstallResult> {
 
     await chmod(temp, 0o755);
     progress = { ...progress, stage: "verifying", message: "Verifying ImageMagick and AVIF support…" };
-    verifyAppImage(temp, release.version);
+    await verifyAppImage(temp, release.version);
 
     progress = { ...progress, stage: "installing", message: `Installing ${fileName}…` };
     if (existsSync(finalFile)) {
@@ -800,7 +969,7 @@ async function installLatestAppImage(): Promise<InstallResult> {
     progress = {
       running: false,
       stage: "done",
-      message: `ImageMagick ${release.version} installed.`,
+      message: `ImageMagick ${release.version} installed.${integrityNote ? ` ${integrityNote}` : ""}`,
       percent: 100,
       version: release.version,
       error: null,
@@ -811,6 +980,7 @@ async function installLatestAppImage(): Promise<InstallResult> {
       folder: IMAGEMAGICK_ROOT,
       bytes,
       replaced,
+      integrityNote,
     };
   } catch (err) {
     const message = errorText(err);
@@ -829,57 +999,127 @@ async function installLatestAppImage(): Promise<InstallResult> {
   }
 }
 
+const DOWNLOAD_IDLE_TIMEOUT_MS = 30_000; // re-armed on every received chunk
+const DOWNLOAD_TOTAL_TIMEOUT_MS = 15 * 60_000; // generous cap for the whole body
+const DOWNLOAD_MAX_ATTEMPTS = 2; // one automatic retry on connection-level failures
+
+/** Distinguishes "server answered with an error status" (usually no retry). */
+class DownloadHttpError extends Error {
+  constructor(
+    readonly status: number,
+    readonly statusText: string,
+  ) {
+    super(`Download failed: HTTP ${status} ${statusText}.`);
+  }
+}
+
+async function downloadAssetOnce(
+  asset: PortableAsset,
+  dest: string,
+  onPercent: (percent: number) => void,
+): Promise<number> {
+  // One AbortController drives both timers. The idle timeout is re-armed on
+  // every received chunk, so progress-polite-but-slow links survive while a
+  // dead connection kills the download within 30 s (previously one fixed
+  // 5-minute whole-body deadline could abort a healthy slow transfer or hang
+  // for its full term on a dead one).
+  const abort = new AbortController();
+  let abortReason: string | null = null;
+  let idleTimer: ReturnType<typeof setTimeout> | null = null;
+  const armIdle = () => {
+    if (idleTimer) clearTimeout(idleTimer);
+    idleTimer = setTimeout(() => {
+      abortReason = `no data received for ${DOWNLOAD_IDLE_TIMEOUT_MS / 1000} s`;
+      abort.abort(new Error(abortReason));
+    }, DOWNLOAD_IDLE_TIMEOUT_MS);
+  };
+  const totalDeadline = setTimeout(() => {
+    abortReason = `the download exceeded its ${DOWNLOAD_TOTAL_TIMEOUT_MS / 60_000} minute limit`;
+    abort.abort(new Error(abortReason));
+  }, DOWNLOAD_TOTAL_TIMEOUT_MS);
+
+  try {
+    let res: Response;
+    try {
+      armIdle();
+      res = await fetch(asset.url, {
+        redirect: "follow",
+        headers: { "user-agent": USER_AGENT, accept: "application/octet-stream" },
+        signal: abort.signal,
+      });
+    } catch (err) {
+      if (abortReason) throw new Error(`Download failed — ${abortReason}.`);
+      throw new Error(`Download failed (${errorText(err)}).`);
+    }
+    if (!res.ok || !res.body) {
+      throw new DownloadHttpError(res.status, res.statusText);
+    }
+
+    const total = Number(res.headers.get("content-length")) || asset.size;
+    const sink = Bun.file(dest).writer();
+    const reader = res.body.getReader();
+    let received = 0;
+    let lastPercent = -1;
+
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        armIdle();
+        if (done) break;
+        if (!value) continue;
+        await sink.write(value);
+        received += value.byteLength;
+        const percent = total > 0 ? Math.min(99, Math.floor((received / total) * 100)) : 0;
+        if (percent !== lastPercent) {
+          lastPercent = percent;
+          onPercent(percent);
+        }
+      }
+      await sink.end();
+    } catch (err) {
+      try { await reader.cancel(); } catch { /* already failing */ }
+      try { await sink.end(); } catch { /* already failing */ }
+      if (abortReason) throw new Error(`Download failed — ${abortReason}.`);
+      throw new Error(`Download was interrupted (${errorText(err)}).`);
+    }
+
+    if (received < 1024) throw new Error("The downloaded archive was empty.");
+    if (asset.size > 0 && received !== asset.size) {
+      throw new Error(`Download was incomplete: got ${received} of ${asset.size} bytes.`);
+    }
+    onPercent(100);
+    return received;
+  } finally {
+    if (idleTimer) clearTimeout(idleTimer);
+    clearTimeout(totalDeadline);
+  }
+}
+
+/**
+ * streamed download with retry: attempts are self-contained (each re-arms its
+ * timers and re-opens the sink) and a partial file never survives either a
+ * retry hand-off or a final failure.
+ */
 async function downloadAsset(
   asset: PortableAsset,
   dest: string,
   onPercent: (percent: number) => void,
 ): Promise<number> {
-  let res: Response;
-  try {
-    res = await fetch(asset.url, {
-      redirect: "follow",
-      headers: { "user-agent": USER_AGENT, accept: "application/octet-stream" },
-      // Large enough for a slow connection: the archive is ~12 MB.
-      signal: AbortSignal.timeout(5 * 60_000),
-    });
-  } catch (err) {
-    throw new Error(`Download failed (${errorText(err)}).`);
-  }
-  if (!res.ok || !res.body) {
-    throw new Error(`Download failed: HTTP ${res.status} ${res.statusText}.`);
-  }
-
-  const total = Number(res.headers.get("content-length")) || asset.size;
-  const sink = Bun.file(dest).writer();
-  const reader = res.body.getReader();
-  let received = 0;
-  let lastPercent = -1;
-
-  try {
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      if (!value) continue;
-      await sink.write(value);
-      received += value.byteLength;
-      const percent = total > 0 ? Math.min(99, Math.floor((received / total) * 100)) : 0;
-      if (percent !== lastPercent) {
-        lastPercent = percent;
-        onPercent(percent);
-      }
+  let lastError: unknown;
+  for (let attempt = 1; attempt <= DOWNLOAD_MAX_ATTEMPTS; attempt++) {
+    try {
+      return await downloadAssetOnce(asset, dest, onPercent);
+    } catch (err) {
+      lastError = err;
+      await rm(dest, { force: true }).catch(() => {}); // never keep partial bytes
+      const status = err instanceof DownloadHttpError ? err.status : 0;
+      // Retry connection-level failures (stall, drop, truncation, 5xx, 429);
+      // a plain 4xx is deterministic and pointless to repeat.
+      const retryable = !(err instanceof DownloadHttpError) || status >= 500 || status === 429;
+      if (attempt >= DOWNLOAD_MAX_ATTEMPTS || !retryable) break;
     }
-    await sink.end();
-  } catch (err) {
-    try { await sink.end(); } catch { /* already failing */ }
-    throw new Error(`Download was interrupted (${errorText(err)}).`);
   }
-
-  if (received < 1024) throw new Error("The downloaded archive was empty.");
-  if (asset.size > 0 && received !== asset.size) {
-    throw new Error(`Download was incomplete: got ${received} of ${asset.size} bytes.`);
-  }
-  onPercent(100);
-  return received;
+  throw lastError instanceof Error ? lastError : new Error(errorText(lastError));
 }
 
 /** Windows ships bsdtar, which reads 7z. Fall back to 7-Zip if it is installed. */
@@ -908,19 +1148,17 @@ function extractionCommands(archive: string, dest: string): Array<{ cmd: string;
   return out;
 }
 
-function extractArchive(archive: string, dest: string): void {
+async function extractArchive(archive: string, dest: string): Promise<void> {
   let lastError = "";
   for (const { cmd, args } of extractionCommands(archive, dest)) {
     try {
-      execFileSync(cmd, args, {
-        stdio: ["ignore", "ignore", "pipe"],
-        timeout: 5 * 60_000,
-        windowsHide: true,
-      });
+      // Clear any partial files from a previous failed extractor before retrying.
+      await rm(dest, { recursive: true, force: true });
+      await mkdir(dest, { recursive: true });
+      await runCapture(cmd, args, { timeoutMs: 5 * 60_000 });
       return;
     } catch (err) {
-      const e = err as { stderr?: Buffer | string; message?: string };
-      lastError = String(e.stderr ?? e.message ?? "unknown extraction error").trim();
+      lastError = errorText(err);
     }
   }
   throw new Error(
@@ -946,21 +1184,12 @@ async function findExtractedRoot(staging: string): Promise<string> {
 }
 
 /** Run the staged binary before trusting it. A wrong download must not install. */
-function verifyStagedMagick(exe: string, expected: string): void {
+async function verifyStagedMagick(exe: string, expected: string): Promise<void> {
   let versionOut: string;
   let formats: string;
   try {
-    versionOut = execFileSync(exe, ["-version"], {
-      encoding: "utf8",
-      timeout: 30_000,
-      windowsHide: true,
-    });
-    formats = execFileSync(exe, ["-list", "format"], {
-      encoding: "utf8",
-      timeout: 60_000,
-      windowsHide: true,
-      maxBuffer: 8 * 1024 * 1024,
-    });
+    versionOut = await runCapture(exe, ["-version"], { timeoutMs: 30_000 });
+    formats = await runCapture(exe, ["-list", "format"], { timeoutMs: 60_000 });
   } catch (err) {
     throw new Error(`The downloaded magick.exe did not run (${errorText(err)}).`);
   }
@@ -971,10 +1200,9 @@ function verifyStagedMagick(exe: string, expected: string): void {
     throw new Error(`Downloaded build reports "${reported.trim()}", expected ${expected}.`);
   }
 
-  const avifLine = formats.split(/\r?\n/).find((l) => /^\s*AVIF\s/.test(l));
-  const mode = avifLine?.trim().split(/\s+/)[1] ?? "";
-  if (!/w/.test(mode)) {
-    throw new Error(`The downloaded build cannot write AVIF (AVIF mode "${mode || "missing"}").`);
+  const avif = parseFormatSupport(formats).avif;
+  if (!avif.writable) {
+    throw new Error(`The downloaded build cannot write AVIF (AVIF mode "${avif.mode || "missing"}").`);
   }
 }
 
@@ -992,6 +1220,40 @@ async function swapIntoPlace(sourceDir: string, finalDir: string): Promise<strin
     throw err;
   }
   return backup;
+}
+
+/** Age guard: debris younger than 1 h is left alone (a live install in another tab/process). */
+const SWEEP_MIN_AGE_MS = 60 * 60 * 1000;
+
+/**
+ * Remove the install debris of crashed runs (`.staging-*` folders, partial
+ * `.download-*` files). Only the app's own dot-prefixed names under the
+ * imagemagick root are touched, only entries older than SWEEP_MIN_AGE_MS,
+ * and this never throws. installLatest() calls it before either flow starts.
+ */
+async function sweepCrashLeftovers(): Promise<void> {
+  try {
+    let entries;
+    try {
+      entries = await readdir(IMAGEMAGICK_ROOT, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    const cutoff = Date.now() - SWEEP_MIN_AGE_MS;
+    for (const entry of entries) {
+      if (!entry.name.startsWith(".staging-") && !entry.name.startsWith(".download-")) continue;
+      const full = path.join(IMAGEMAGICK_ROOT, entry.name);
+      try {
+        const st = await stat(full);
+        if (st.mtimeMs > cutoff) continue;
+      } catch {
+        continue;
+      }
+      await rm(full, { recursive: true, force: true }).catch(() => {});
+    }
+  } catch {
+    // Sweeping is best-effort; an install must never fail because of it.
+  }
 }
 
 /** Delete older installs this app created. Hand-placed folders are left alone. */

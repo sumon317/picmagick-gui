@@ -26,12 +26,12 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.x
 
       # Electrobun's Linux launcher links GTK 3 and WebKitGTK 4.1.
       - name: Install Linux build dependencies
@@ -64,6 +64,10 @@ jobs:
           mkdir -p "${{ runner.temp }}/stashed-artifacts"
           cp -r artifacts/* "${{ runner.temp }}/stashed-artifacts/"
 
+      # NOTE: bundles whatever official ImageMagick release is current at
+      # build time (installLatest), so full installers are not reproducible
+      # across days. TODO: pin a tested version once imagemagick.ts exposes a
+      # versioned install entry point.
       - name: Download ImageMagick for bundling
         run: bun run scripts/ensure-bundled-magick.ts
         env:
@@ -90,7 +94,7 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload installers and update artifacts
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: desktop-${{ matrix.platform }}
           path: artifacts/*
@@ -104,15 +108,15 @@ jobs:
 
     steps:
       - name: Check out
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Set up Bun
-        uses: oven-sh/setup-bun@v2
+        uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2.2.0
         with:
-          bun-version: latest
+          bun-version: 1.4.x
 
       - name: Collect artifacts
-        uses: actions/download-artifact@v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
           path: artifacts
           merge-multiple: true
@@ -123,7 +127,7 @@ jobs:
         run: bun run scripts/release-notes.ts "$GITHUB_REF_NAME" > release-notes.md
 
       - name: Publish release
-        uses: softprops/action-gh-release@v3
+        uses: softprops/action-gh-release@8a0cd651e5b2365bd640854a3fa5dfc70e4875f3 # v3.0.4
         with:
           body_path: release-notes.md
           files: artifacts/*

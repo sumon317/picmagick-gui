@@ -53,6 +53,7 @@ import {
   type UpdateStatus,
   type VerifyResponse,
   type VideoPolicy,
+  type VideoStatusResponse,
 } from "./types";
 import { createAuditView, type AuditViewController } from "./views/audit";
 import { createCompareView, type CompareViewController } from "./views/compare";
@@ -216,25 +217,28 @@ const schedulePreview = debounce((): void => {
   void refreshPreview();
 }, 180);
 
-const refreshPreview = async (): Promise<void> => {
+const refreshPreview = async (persist = true): Promise<void> => {
   if (!state.tree) return;
 
   const seq = ++previewSeq;
   state.previewSeq = seq;
   state.previewBusy = true;
   try {
-    await save();
+    // persist=false is the boot-hydration preview: the server already holds
+    // exactly the policy the client hydrated from /api/status, so re-posting
+    // it (config or preview body) can only re-save identical data - and after
+    // a botched merge, a boot save could overwrite the stored policy with a
+    // shrunk one. Skip the save; the preview still renders.
+    if (persist) await save();
     const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
     const destVal = isCustomVideo
       ? (input("destination").value.trim() || state.videoCustomDestination)
       : undefined;
     const preview = await api<PreviewResponse>("preview", {
       method: "POST",
-      body: {
-        policy: activePolicy(),
-        customDestination: destVal,
-        destination: destVal,
-      },
+      body: persist
+        ? { policy: activePolicy(), customDestination: destVal, destination: destVal }
+        : { customDestination: destVal, destination: destVal },
     });
     if (seq !== previewSeq) return;
     state.preview = preview;
@@ -455,6 +459,7 @@ const renderRecentSources = (sources?: string[]): void => {
 };
 
 const applySource = async (silent = false): Promise<void> => {
+  if (scanning) return; // a scan (boot rescan included) already owns the busy state
   const source = input("sourceRoot").value.trim();
   const previousSource = state.status?.sourceRoot ?? "";
   if (!source) {
@@ -698,14 +703,17 @@ const switchMediaMode = async (next: "image" | "video"): Promise<void> => {
   $("videoDestModes").classList.toggle("hidden", !isVideo);
 
   if (isVideo) {
-    const vStatus = await api<any>("video/status");
+    const vStatus = await api<VideoStatusResponse>("video/status");
     state.videoStatus = vStatus;
     const vPolicy = vStatus.policy;
     state.videoDestMode = vPolicy.destMode ?? "merge";
     state.videoCustomDestination = vStatus.customDestination ?? "";
     extEnabled = { ...vPolicy.extEnabled };
 
-    input("jobs").value = String(vPolicy.jobs ?? 1);
+    // VideoPolicy carries no jobs field, so this used to stomp the shared
+    // jobs slider to 1 on every switch to video - and switching back never
+    // restored it, silently downgrading photo runs too. The slider keeps the
+    // user's value; video runs send it in the run POST (server clamps 1-8).
     updateJobsReadout();
     input("videoContainer").value = vPolicy.container ?? "mp4";
     input("videoMaxRes").value = String(vPolicy.maxResolution ?? 0);
@@ -823,7 +831,7 @@ const installFfmpeg = async (): Promise<void> => {
     await api("video/ffmpeg/install", { method: "POST", body: {} });
     toast("FFmpeg installed successfully!", "success");
     $("ffUpdate").classList.add("hidden");
-    const vStatus = await api<any>("video/status");
+    const vStatus = await api<VideoStatusResponse>("video/status");
     state.videoStatus = vStatus;
     formatUi.refreshCards();
   } catch (err) {
@@ -857,6 +865,7 @@ const renderExtToggles = (): void => {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "ext-chip" + (enabled ? " on" : "") + (fileCount === 0 && state.tree ? " zero" : "");
+    chip.setAttribute("aria-pressed", String(enabled));
     chip.textContent = fileCount > 0 ? `.${ext} (${fileCount.toLocaleString()})` : `.${ext}`;
     chip.title = fileCount > 0
       ? `${fileCount.toLocaleString()} files · ${fmt(bytes)} · ${enabled ? "Click to skip" : "Click to include"}`
@@ -942,13 +951,25 @@ const runEstimate = async (): Promise<void> => {
     });
     state.lastEstimate = estimate;
     const ratio = estimate.ratio > 0 ? `${(1 / estimate.ratio).toFixed(1)}:1` : "—";
+    // E-2: unmeasured means every sample encode failed - projectedSeconds is 0
+    // as a sentinel, so "0s" would lie. Render unknown, with the server's
+    // reason when it gave one. Older payloads without the flag keep 0s.
+    const unmeasured = estimate.method === "unmeasured" || estimate.unmeasured === true;
+    const methodLabel = estimate.method === "sampled"
+      ? "Sampled encode"
+      : unmeasured
+        ? "Unmeasured (no sample succeeded)"
+        : "Flat ratio";
+    const timeCell = unmeasured
+      ? `<dt>Projected time</dt><dd class="mono">unknown${estimate.unmeasuredReason ? ` — ${escapeHtml(estimate.unmeasuredReason)}` : ""}</dd>`
+      : `<dt>Projected time</dt><dd class="mono">${dur(estimate.projectedSeconds)}</dd>`;
     box.innerHTML = `<h4>Estimate <small>${estimate.sampleSize.toLocaleString()} files sampled · ${escapeHtml(state.formatSpecs[estimate.format]?.shortLabel ?? estimate.format)}</small></h4>
       <dl class="kv">
         <dt>Measured ratio</dt><dd class="mono">${ratio}</dd>
         <dt>Mean output</dt><dd class="mono">${fmt(estimate.meanOutputBytes)}</dd>
         <dt>Projected output</dt><dd class="mono">${fmt(estimate.projectedOutputBytes)}</dd>
-        <dt>Projected time</dt><dd class="mono">${dur(estimate.projectedSeconds)}</dd>
-        <dt>Method</dt><dd>${estimate.method === "sampled" ? "Sampled encode" : "Flat ratio"} · ${dur(estimate.durationMs / 1000)}</dd>
+        ${timeCell}
+        <dt>Method</dt><dd>${methodLabel} · ${dur(estimate.durationMs / 1000)}</dd>
       </dl>`;
     plan.render();
     await refreshPreview();
@@ -1710,7 +1731,7 @@ const boot = async (): Promise<void> => {
     updateStartOptions();
 
     try {
-      const vStatus = await api<any>("video/status");
+      const vStatus = await api<VideoStatusResponse>("video/status");
       state.videoStatus = vStatus;
       if (!vStatus.ffmpeg) {
         $("ffUpdate").classList.remove("hidden");
@@ -1726,11 +1747,29 @@ const boot = async (): Promise<void> => {
     }
 
     if (status.scanned) {
-      const scan = await api<ScanResult>("scan", { method: "POST", body: {} });
-      library.setScan(scan, false);
-      renderRecentSources(scan.recentSources);
-      renderExtToggles();
-      await refreshPreview();
+      // F-11: the boot rescan owns the same busy state as a user scan, so a
+      // click on Scan (or Enter in the source field) cannot fire a second,
+      // overlapping scan while boot work is still in flight.
+      scanning = true;
+      $<HTMLButtonElement>("btnScan").disabled = true;
+      $("btnScan").textContent = "Scanning…";
+      updateChrome();
+      try {
+        const scan = await api<ScanResult>("scan", { method: "POST", body: {} });
+        library.setScan(scan, false);
+        renderRecentSources(scan.recentSources);
+        renderExtToggles();
+        // Boot hydration preview: never save() - the policy on disk already
+        // holds exactly what /api/status returned (HIGH-1: no boot save wiring).
+        await refreshPreview(false);
+      } catch (scanError) {
+        toast(formatError(scanError), "danger");
+      } finally {
+        scanning = false;
+        $<HTMLButtonElement>("btnScan").disabled = false;
+        $("btnScan").textContent = "Scan";
+        updateChrome();
+      }
     } else if (status.sourceRoot) {
       // A saved library that has not been scanned yet: build the tree now so
       // the app opens ready to work. This runs once, after the shell is wired.

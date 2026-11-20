@@ -11,6 +11,7 @@ import type { Decision } from "./policy.ts";
 import { outputPathFor, type Policy } from "./policy.ts";
 import { buildEncoderArgs, sourceArgFor } from "./formats.ts";
 import { applyProcessCpuLimit, getTotalCpus } from "./cpu.ts";
+import { isAppImage } from "./paths.ts";
 
 export type FileStatus = "converted" | "copied" | "skipped" | "failed" | "cancelled";
 
@@ -18,6 +19,8 @@ export type FileResult = {
   rel: string;
   src: string;
   out: string | null;
+  /** Every output file written for this source; multi-quality runs produce several. */
+  outs?: { out: string; bytes: number }[];
   status: FileStatus;
   seconds: number;
   inBytes: number;
@@ -46,6 +49,12 @@ export type RunOptions = {
   /** Mid-run child process registration for live CPU affinity updates. */
   onChildSpawn?: (pid: number) => void;
   onChildExit?: (pid: number) => void;
+  /**
+   * Receives a wake function the moment the pool starts work: calling it makes
+   * the pool re-dispatch immediately, so raising the parallel limit mid-run
+   * starts new encodes without waiting for a running one to finish.
+   */
+  onWake?: (wake: () => void) => void;
   overwrite: boolean;
   signal: AbortSignal;
   onStart: (rel: string, bytes: number) => void;
@@ -68,13 +77,24 @@ function runMagick(
   const threadsPerJob = String(Math.max(1, Math.floor(allowedCpus / Math.max(1, activeJobs))));
 
   return new Promise((resolve) => {
+    // A signal aborted before we got here never fires its listeners, so the
+    // kill-hook below would never run and the encode would run to completion.
+    if (signal.aborted) {
+      return resolve({ code: -1, signal: null, stderr: "aborted" });
+    }
     const child = spawn(exe, args, {
       windowsHide: true,
+      // Nothing is read from the child's stdout; don't hold a pipe open on it.
+      stdio: ["ignore", "ignore", "pipe"],
       // On Linux, make the encoder a process-group leader so cancelling an
       // AppImage wrapper also terminates the inner magick it forked.
       detached: process.platform === "linux",
       env: {
         ...process.env,
+        // Custom AppImage magick handed straight to the converter (cached /
+        // user-picked path) would fail every spawn without this: the fallback
+        // env is otherwise only set by paths.ts probe retries.
+        ...(isAppImage(exe) ? { APPIMAGE_EXTRACT_AND_RUN: "1" } : {}),
         MAGICK_THREAD_LIMIT: threadsPerJob,
         OMP_NUM_THREADS: threadsPerJob,
       },
@@ -185,6 +205,7 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
     let totalOut = 0;
     let anyWritten = false;
     let primaryOut: string | null = null;
+    const written: { out: string; bytes: number }[] = [];
     let lastErr = "";
 
     for (const q of o.policy.qualities) {
@@ -302,6 +323,7 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
         totalOut += st.size;
         anyWritten = true;
         if (!primaryOut) primaryOut = out;
+        written.push({ out, bytes: st.size });
       } catch {
         await rm(partOut, { force: true }).catch(() => {});
         activePart = null;
@@ -316,7 +338,7 @@ async function processOne(d: Decision, o: RunOptions): Promise<FileResult> {
       // rather than reporting a clean "converted".
       const partialErrors = lastErr ? [lastErr] : undefined;
       return {
-        ...base, out: primaryOut, status: "converted", seconds,
+        ...base, out: primaryOut, outs: written, status: "converted", seconds,
         outBytes: totalOut, partialErrors,
       };
     }
@@ -370,8 +392,10 @@ export async function runPool<T>(
   worker: (item: T, index: number) => Promise<void>,
   shouldStop: () => boolean = () => false,
   getLimit: () => number = () => 1,
+  onWake?: (wake: () => void) => void,
 ): Promise<void> {
   let cursor = 0;
+  let done = false;
   const inFlight = new Set<Promise<unknown>>();
 
   const dispatch = () => {
@@ -390,11 +414,17 @@ export async function runPool<T>(
     }
   };
 
+  // The wake simply re-runs dispatch: all its own guards (limit, cursor,
+  // shouldStop, abort) are rechecked, and touching the shared set from outside
+  // is safe because every step is synchronous.
+  if (onWake) onWake(() => { if (!done) dispatch(); });
+
   dispatch();
   while (inFlight.size > 0) {
     await Promise.race(inFlight);
     dispatch();
   }
+  done = true;
 }
 
 export type ConversionSummary = {
@@ -429,6 +459,7 @@ export async function runConversion(
     },
     shouldStop,
     options.getLimit,
+    options.onWake,
   );
 
   return {

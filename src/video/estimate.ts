@@ -82,6 +82,7 @@ export async function estimateVideoFromSample(opts: {
       totalConvert: 0,
       totalConvertBytes: 0,
       method: "flat",
+      unmeasured: false, // honest structural guess, not a failed measurement
       durationMs: 0,
       format: opts.policy.outputFormat as unknown as OutputFormat,
     };
@@ -199,11 +200,16 @@ export async function estimateVideoFromSample(opts: {
       ? Math.min(1.0, producedSliceBytes / sampledSourceEquivalentBytes)
       : fallbackRatio;
 
-  // Extrapolate how long a full average video takes based on slice encode speed
+  // Extrapolate how long a full average video takes based on slice encode speed.
+  // When EVERY slice failed there is no measurement: falling back to invented
+  // constants (15 s average duration x 1.0 encode-rate) projected a made-up
+  // multi-hour number as if it were a real estimate. Zero + unmeasured flag
+  // says "unknown" instead.
+  const unmeasured = successCount === 0;
   const meanVideoDuration =
-    successCount > 0 ? totalSampleDurationSec / successCount : 15;
+    successCount > 0 ? totalSampleDurationSec / successCount : 0;
   const encodeSecPerVideoSec =
-    encodedSliceDurationSec > 0 ? encodeWallMs / 1000 / encodedSliceDurationSec : 1.0;
+    encodedSliceDurationSec > 0 ? encodeWallMs / 1000 / encodedSliceDurationSec : 0;
   const secondsPerVideo = meanVideoDuration * encodeSecPerVideoSec;
 
   const projectedOutputBytes = Math.round(totalConvertBytes * ratio + totalCopyBytes);
@@ -221,7 +227,11 @@ export async function estimateVideoFromSample(opts: {
     projectedSeconds,
     totalConvert,
     totalConvertBytes,
-    method: successCount > 0 ? "sampled" : "flat",
+    method: unmeasured ? "unmeasured" : "sampled",
+    unmeasured,
+    unmeasuredReason: unmeasured
+      ? `all ${sample.length} slice encodes failed - bytes projected from format default ratio ${ratio}, time unknown`
+      : undefined,
     durationMs: Date.now() - started,
     format: opts.policy.outputFormat as unknown as OutputFormat,
   };

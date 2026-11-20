@@ -19,7 +19,12 @@ export function parseVersion(text: string): VersionTuple | null {
 export function compareVersions(a: string | VersionTuple, b: string | VersionTuple): number {
   const pa = typeof a === "string" ? parseVersion(a) : a;
   const pb = typeof b === "string" ? parseVersion(b) : b;
-  if (!pa || !pb) return 0;
+  // Anything unparseable sorts before every parseable version. Returning 0
+  // would make one unparseable name "equal" to all versions at once, which
+  // breaks the strict weak ordering Array.prototype.sort relies on.
+  if (!pa && !pb) return 0;
+  if (!pa) return -1;
+  if (!pb) return 1;
   for (let i = 0; i < 4; i++) {
     if (pa[i] !== pb[i]) return pa[i]! - pb[i]!;
   }

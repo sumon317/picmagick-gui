@@ -9,7 +9,7 @@
  *   bun run src/platform.check.ts
  */
 import { strict as assert } from "node:assert";
-import { mkdir, mkdtemp, rm, utimes, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, utimes, writeFile, access } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 
@@ -20,12 +20,13 @@ import { applyPolicy, DEFAULT_POLICY, outputPathFor, type Decision } from "./pol
 import type { ScanResult, ScannedFile } from "./scan.ts";
 import { undoManifest, type Manifest } from "./manifest.ts";
 import { analyseSync } from "./sync.ts";
-import { isAppImage } from "./paths.ts";
+import { assertDestinationSafe, isAppImage } from "./paths.ts";
 import {
   IMAGEMAGICK_ROOT, isManagedInstall, isTrustedReleaseUrl,
   pickAppImageAsset, pickPortableAsset,
 } from "./imagemagick.ts";
 import { pickLeanAppAsset } from "./app-update.ts";
+import { runHealthCheck } from "./health.ts";
 import { migrateLegacyData } from "./migration.ts";
 import { calculateAffinityMask, applyProcessCpuLimit, suspendProcess, resumeProcess } from "./cpu.ts";
 import { spawn } from "node:child_process";
@@ -77,7 +78,14 @@ await check("uses the platform separator by default", () => {
 });
 
 await check("treats a literal backslash as a filename character on Linux", () => {
-  if (!IS_WINDOWS) assert.equal(relTop("album\\november.jpg"), "album\\november.jpg");
+  if (IS_WINDOWS) {
+    // A backslash cannot appear inside a filename on Windows, so there is
+    // nothing to assert here; the Linux CI job runs the check below. The
+    // early return keeps the skip explicit instead of a vacuous pass.
+    console.log("  skip backslash-as-name assert (not representable on Windows)");
+    return;
+  }
+  assert.equal(relTop("album\\november.jpg"), "album\\november.jpg");
 });
 
 await check("matches prefixes only on a path boundary", () => {
@@ -501,7 +509,10 @@ await check("migrateLegacyData copies ImageMagick, FFmpeg, and manifests from ol
     await writeFile(path.join(legacyDir, "manifests", "run1.json"), "{}");
     await writeFile(path.join(legacyDir, ".picmagic-manifest-root.json"), "{}");
 
-    const summary = migrateLegacyData(targetDir, [legacyDir]);
+    // The migration is now async (MIG-2) and identifies binaries by a
+    // -version probe (MIG-1); this legacy behavior check bypasses the probe
+    // to keep asserting the copy/idempotency mechanics with dummy files.
+    const summary = await migrateLegacyData(targetDir, [legacyDir], { integrityCheck: false });
     assert.equal(summary.migratedMagick, true);
     assert.equal(summary.migratedFfmpeg, true);
     assert.equal(summary.migratedManifests, 2);
@@ -512,9 +523,93 @@ await check("migrateLegacyData copies ImageMagick, FFmpeg, and manifests from ol
     assert.equal(await Bun.file(path.join(targetDir, ".picmagic-manifest-root.json")).text(), "{}");
 
     // Idempotent: second run does not re-copy over existing target files
-    const secondSummary = migrateLegacyData(targetDir, [legacyDir]);
+    const secondSummary = await migrateLegacyData(targetDir, [legacyDir], { integrityCheck: false });
     assert.equal(secondSummary.migratedMagick, false);
     assert.equal(secondSummary.migratedFfmpeg, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+await check("migrateLegacyData refuses toolchain binaries that fail the -version identity check (MIG-1)", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "compakta-migration-"));
+  try {
+    const legacyDir = path.join(root, "legacy-picmagick-gui");
+    const targetDir = path.join(root, "Compakta");
+    await mkdir(path.join(legacyDir, "imagemagick"), { recursive: true });
+    await mkdir(path.join(legacyDir, "ffmpeg"), { recursive: true });
+    await mkdir(targetDir, { recursive: true });
+
+    // Impostor payloads: a text file named magick.exe cannot answer
+    // "ImageMagick" on -version, and ffmpeg.exe cannot answer "ffmpeg version".
+    await writeFile(path.join(legacyDir, "imagemagick", "magick.exe"), "not a real magick");
+    await writeFile(path.join(legacyDir, "ffmpeg", "ffmpeg.exe"), "not a real ffmpeg");
+    // But valid JSON manifests are still migrated - they are data, not code.
+    await writeFile(path.join(legacyDir, ".compakta-manifest-run.json"), "{\"ok\":true}");
+    // An invalid JSON manifest is refused.
+    await writeFile(path.join(legacyDir, ".compakta-manifest-bad.json"), "{definitely not json");
+
+    const summary = await migrateLegacyData(targetDir, [legacyDir]); // default: integrityCheck on
+    assert.equal(summary.migratedMagick, false);
+    assert.equal(summary.migratedFfmpeg, false);
+    assert.ok(summary.integrityNote, "integrityNote explains the skips");
+    assert.ok(!await existsSafe(path.join(targetDir, "imagemagick", "magick.exe")), "impostor binary NOT copied");
+    assert.ok(!await existsSafe(path.join(targetDir, "ffmpeg", "ffmpeg.exe")), "impostor ffmpeg NOT copied");
+    assert.equal(summary.migratedManifests, 1, "only the valid JSON manifest migrates");
+    assert.ok(
+      await existsSafe(path.join(targetDir, ".compakta-manifest-run.json")),
+      "valid manifest copied",
+    );
+    assert.ok(
+      !await existsSafe(path.join(targetDir, ".compakta-manifest-bad.json")),
+      "invalid JSON manifest refused",
+    );
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+async function existsSafe(p: string): Promise<boolean> {
+  try { await access(p); return true; } catch { return false; }
+}
+
+await check("runHealthCheck fails (not warns) when destination is an existing file", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "compakta-health-"));
+  try {
+    const srcDir = path.join(root, "src");
+    const destFile = path.join(root, "not-a-dir");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(destFile, "blocking-file");
+
+    const report = await runHealthCheck(srcDir, destFile, 1024, "avif");
+    const destCheck = report.checks.find((c) => c.id === "dest");
+    assert.ok(destCheck);
+    assert.equal(destCheck.status, "fail");
+    assert.equal(report.canRun, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+await check("assertDestinationSafe rejects relative paths and nested destinations", () => {
+  const src = path.resolve(tmpdir(), "compakta-src-safe-test");
+  assert.throws(() => assertDestinationSafe(src, "relative-out"), /absolute path/i);
+  assert.throws(() => assertDestinationSafe(src, path.join(src, "nested")), /inside the source/i);
+  assert.doesNotThrow(() => assertDestinationSafe(src, `${src}-out`));
+});
+
+await check("runHealthCheck fails when destination is inside source", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "compakta-health-safe-"));
+  try {
+    const srcDir = path.join(root, "src");
+    const nestedDest = path.join(srcDir, "out");
+    await mkdir(srcDir, { recursive: true });
+
+    const report = await runHealthCheck(srcDir, nestedDest, 1024, "avif");
+    const safeCheck = report.checks.find((c) => c.id === "dest-safe");
+    assert.ok(safeCheck);
+    assert.equal(safeCheck.status, "fail");
+    assert.equal(report.canRun, false);
   } finally {
     await rm(root, { recursive: true, force: true });
   }

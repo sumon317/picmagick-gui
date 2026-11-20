@@ -2,7 +2,8 @@
 # One-click launcher for Compakta on Linux.
 set -euo pipefail
 
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd -- "$(dirname -- "$(readlink -f -- "$0" 2>/dev/null || printf '%s' "$0")")" && pwd)"
+cd -- "$SCRIPT_DIR"
 
 if ! command -v bun >/dev/null 2>&1; then
   echo
@@ -13,4 +14,4 @@ if ! command -v bun >/dev/null 2>&1; then
 fi
 
 echo "Starting Compakta..."
-exec bun run src/server.ts --open
+exec bun run src/server.ts --open "$@"

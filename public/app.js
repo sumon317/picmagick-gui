@@ -201,6 +201,28 @@ var debounce = (fn, delay) => {
     timer = setTimeout(() => fn(...args), delay);
   };
 };
+function createFrameCoalescer(fn, schedule = typeof requestAnimationFrame === "function" ? (cb) => void requestAnimationFrame(cb) : (cb) => void setTimeout(cb, 16)) {
+  let queued = false;
+  const run = () => {
+    if (!queued)
+      return;
+    queued = false;
+    fn();
+  };
+  return {
+    request: () => {
+      if (queued)
+        return;
+      queued = true;
+      schedule(run);
+    },
+    flush: () => {
+      queued = false;
+      fn();
+    },
+    pending: () => queued
+  };
+}
 var toastIcon = {
   info: "info",
   success: "check-circle",
@@ -537,12 +559,16 @@ function createFormatUi(options) {
 }
 
 // src/client/tree-logic.ts
-var excludedLower = (set, caseInsensitive = true) => new Set([...set].map((e) => caseInsensitive ? e.toLowerCase() : e));
+var SLASH_LIKE = /[\u002F\u005C\u2044\u2215\u29F5\u29F8\uFF0F\uFF3C]/g;
+var fold = (s, caseInsensitive) => {
+  const folded = s.normalize("NFC").replace(SLASH_LIKE, "/").replace(/\/+$/, "");
+  return caseInsensitive ? folded.toLowerCase() : folded;
+};
+var excludedLower = (set, caseInsensitive = true) => new Set([...set].map((e) => fold(e, caseInsensitive)));
 var pathOptions = (opts) => ({
   sep: opts?.sep === "/" ? "/" : "\\",
   caseInsensitive: opts?.caseInsensitive !== false
 });
-var fold = (s, caseInsensitive) => caseInsensitive ? s.toLowerCase() : s;
 function isFullyExcluded(rel, ex, inc = new Set, opts = {}) {
   if (!rel)
     return false;
@@ -570,7 +596,9 @@ function isFileExcluded(rel, exFolders, incFolders, exFiles, incFiles, opts = {}
     return false;
   if (exFiles.has(key))
     return true;
-  return isFullyExcluded(rel, exFolders, incFolders, opts);
+  const sepPos = Math.max(rel.lastIndexOf("/"), rel.lastIndexOf("\\"));
+  const dir = sepPos === -1 ? "" : rel.slice(0, sepPos);
+  return isFullyExcluded(dir, exFolders, incFolders, opts);
 }
 function toggleFile(rel, nowExcluded, excludedFiles = new Set, includedFiles = new Set, opts = {}) {
   const { caseInsensitive } = pathOptions(opts);
@@ -590,11 +618,11 @@ function toggleFile(rel, nowExcluded, excludedFiles = new Set, includedFiles = n
   return { excludedFiles: ex, includedFiles: inc };
 }
 function clearFileOverridesUnder(rel, excludedFiles, includedFiles, opts = {}) {
-  const { sep, caseInsensitive } = pathOptions(opts);
+  const { caseInsensitive } = pathOptions(opts);
   const key = fold(rel, caseInsensitive);
   const atOrBelow = (p) => {
     const k = fold(p, caseInsensitive);
-    return k === key || k.startsWith(key + sep);
+    return k === key || k.startsWith(key + "/");
   };
   return {
     excludedFiles: new Set([...excludedFiles].filter((p) => !atOrBelow(p))),
@@ -620,13 +648,13 @@ function countSelection(node, isSelected, out = new Map) {
 function toggleFolder(tree, excluded, rel, nowExcluded, included = new Set, opts = {}) {
   const ex = new Set(excluded);
   const inc = new Set(included);
-  const { sep, caseInsensitive } = pathOptions(opts);
+  const { caseInsensitive } = pathOptions(opts);
   const key = fold(rel, caseInsensitive);
   const atOrBelow = (e) => {
     const k = fold(e, caseInsensitive);
-    return k === key || k.startsWith(key + sep);
+    return k === key || k.startsWith(key + "/");
   };
-  const ancestorExcluded = [...ex].some((e) => key.startsWith(fold(e, caseInsensitive) + sep));
+  const ancestorExcluded = [...ex].some((e) => key.startsWith(fold(e, caseInsensitive) + "/"));
   for (const e of [...ex])
     if (atOrBelow(e))
       ex.delete(e);
@@ -671,7 +699,6 @@ function createLibrary(opts) {
     sep: state.status?.pathSeparator ?? "\\",
     caseInsensitive: state.status?.caseInsensitive ?? true
   });
-  const fold = (value) => state.status?.caseInsensitive ?? true ? value.toLowerCase() : value;
   const allFiles = () => {
     if (!state.tree)
       return [];
@@ -701,16 +728,6 @@ function createLibrary(opts) {
     return allFiles().filter((file) => !isFileExcluded(file.rel, ex, inc, exFiles, incFiles, o));
   };
   const selectedBytes = () => selected().reduce((sum, file) => sum + file.size, 0);
-  const prune = () => {
-    if (!state.tree)
-      return;
-    const folders = new Set(collectRels(state.tree).map(fold));
-    const files = new Set(allFiles().map((file) => fold(file.rel)));
-    state.excluded = new Set([...state.excluded].filter((rel) => folders.has(fold(rel))));
-    state.included = new Set([...state.included].filter((rel) => folders.has(fold(rel))));
-    state.excludedFiles = new Set([...state.excludedFiles].filter((rel) => files.has(fold(rel))));
-    state.includedFiles = new Set([...state.includedFiles].filter((rel) => files.has(fold(rel))));
-  };
   const matchesActiveMode = (file) => {
     return state.mediaMode === "video" ? file.category === "video" : file.category === "image" || file.category === "raw";
   };
@@ -910,7 +927,8 @@ function createLibrary(opts) {
     check.indeterminate = indeterminate;
     check.setAttribute("aria-label", `Include ${node.name} and everything in it`);
     check.addEventListener("click", (event) => event.stopPropagation());
-    check.addEventListener("change", () => setExcluded(node.rel, !check.checked));
+    const wasPartial = indeterminate;
+    check.addEventListener("change", () => setExcluded(node.rel, wasPartial ? false : !check.checked));
     const caret = document.createElement("button");
     caret.type = "button";
     caret.className = "tree-caret" + (hasKids ? "" : " leaf");
@@ -1076,7 +1094,6 @@ function createLibrary(opts) {
     state.includedFiles = files.includedFiles;
     if (exclude)
       state.expanded.add(rel);
-    prune();
     render();
     notify();
   };
@@ -1084,7 +1101,6 @@ function createLibrary(opts) {
     const result = toggleFile(file.rel, !select, state.excludedFiles, state.includedFiles, pathOptions());
     state.excludedFiles = result.excludedFiles;
     state.includedFiles = result.includedFiles;
-    prune();
     render();
     notify();
   };
@@ -1104,7 +1120,6 @@ function createLibrary(opts) {
       state.filterQuery = "";
       filterInput.value = "";
     }
-    prune();
     render();
     opts.onChange();
   };
@@ -1573,6 +1588,7 @@ function createRunLifecycle(options) {
   const render = () => {
     options.render();
   };
+  const renderCoalesced = createFrameCoalescer(render);
   const setActivity = (file) => {
     if (!file)
       return;
@@ -1635,6 +1651,7 @@ function createRunLifecycle(options) {
     options.onFinished();
   };
   const handleEvent = (event) => {
+    let coalesce = false;
     if (event.type === "hello") {
       if (event.jobId)
         state.run.id = event.jobId;
@@ -1651,6 +1668,7 @@ function createRunLifecycle(options) {
         state.run.total = event.total;
       state.run.note = event.message ?? null;
     } else if (event.type === "progress") {
+      coalesce = true;
       state.run.state = "running";
       state.running = true;
       state.starting = false;
@@ -1690,6 +1708,7 @@ function createRunLifecycle(options) {
       finish(event);
       return;
     } else if (event.type === "error") {
+      document.title = "Compakta";
       state.es?.close();
       state.es = null;
       state.currentJob = null;
@@ -1705,7 +1724,10 @@ function createRunLifecycle(options) {
       options.onError(event.message ?? "The run failed.");
       options.onFinished();
     }
-    render();
+    if (coalesce)
+      renderCoalesced.request();
+    else
+      renderCoalesced.flush();
   };
   const stream = (jobId) => {
     state.es?.close();
@@ -1808,7 +1830,8 @@ function createRunLifecycle(options) {
       }
     }
     state.starting = false;
-    state.running = true;
+    if (!replay)
+      state.running = true;
     stream(jobId);
     render();
   };
@@ -1867,10 +1890,14 @@ function createRunLifecycle(options) {
     if (!state.currentJob)
       return false;
     try {
-      await api(path, { method: "POST" });
+      const res = await api(path, { method: "POST" });
+      if (res && res.ok === false) {
+        options.onError(res.message ?? "That action was refused.");
+        return false;
+      }
       if (success) {
         state.run.note = success;
-        render();
+        renderCoalesced.flush();
       }
       return true;
     } catch (error) {
@@ -2260,9 +2287,14 @@ function createAuditView(actions) {
   const renderDuplicates = (data) => {
     dupeData = data;
     $("auditMeta").textContent = data.groupCount ? `${data.groupCount} groups` : "3 reports";
+    const hashBudgetWarning = data.truncated === true ? `<p class="warn">Hash budget reached: only the first ${(data.candidateCount ?? 0).toLocaleString()} same-size candidates were hashed; larger files on disk were not compared, ${data.unhashedGroups != null ? data.unhashedGroups.toLocaleString() : "n/a"} group(s) unhashed.</p>` : "";
+    const hashErrors = data.hashErrors ?? 0;
+    const hashErrorsWarning = hashErrors > 0 ? `<p class="warn">${hashErrors.toLocaleString()} file(s) could not be hashed (unreadable or locked) — results may be incomplete.</p>` : "";
     if (!data.groupCount) {
       $("dupeBox").innerHTML = `<div class="result-box">
         <h4>Duplicates <small>${data.hashedFiles.toLocaleString()} hashed</small></h4>
+        ${hashBudgetWarning}
+        ${hashErrorsWarning}
         <p class="ok">No duplicates found in ${data.hashedFiles.toLocaleString()} hashed files.</p>
         <div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button></div>
       </div>`;
@@ -2277,7 +2309,9 @@ function createAuditView(actions) {
         <div class="dupe-head"><span>${escapeHtml(base(group.members[0].rel))}</span><span class="muted">${group.members.length} copies · ${fmt(group.size)}</span></div>
         <div class="dupe-members">${group.members.slice(0, 3).map((m) => escapeHtml(base(m.rel))).join(" · ")}${group.members.length > 3 ? " …" : ""}${group.spreadAcrossFolders ? " · across folders" : ""}</div>
       </div>`).join("")}
-      ${data.groupCount > groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>` : ""}
+      ${data.groupCount > data.groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups (response capped at ${data.groups.length.toLocaleString()}).</p>` : data.groupCount > groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>` : ""}
+      ${hashBudgetWarning}
+      ${hashErrorsWarning}
       <div class="drawer-actions">
         <button class="btn sm" type="button" data-exclude-dupes="${totalRemovable}">Exclude ${totalRemovable.toLocaleString()} duplicates</button>
         <button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button>
@@ -2416,7 +2450,7 @@ function createAuditView(actions) {
         try {
           const res = await api("sync/clean-orphans", {
             method: "POST",
-            body: {}
+            body: { confirm: true }
           });
           actions.toast(`Removed ${res.removed.toLocaleString()} orphan files, freed ${fmt(res.bytesFreed)}.`, "success");
           runSync();
@@ -2542,17 +2576,27 @@ function createCompareView(actions) {
     });
   };
   const fileList = () => actions.selectedFiles();
+  const FILE_SELECT_CAP = 1000;
+  let fileSelectCache = null;
   const syncFileSelect = (rel) => {
     const select = $("compareFileSelect");
     const files = fileList();
     const nameOf = (value) => value.split(/[\\/]/).pop() ?? value;
     const inList = rel ? files.some((f) => f.rel === rel) : false;
-    const options = files.map((f) => `<option value="${escapeHtml(f.rel)}"${f.rel === rel ? " selected" : ""}>${escapeHtml(nameOf(f.rel))}</option>`).join("");
+    const overflow = Math.max(0, files.length - FILE_SELECT_CAP);
+    const shown = overflow ? files.slice(0, FILE_SELECT_CAP) : files;
+    const key = `${files.length}|${files[0]?.rel ?? ""}|${files[files.length - 1]?.rel ?? ""}`;
+    if (!fileSelectCache || fileSelectCache.key !== key) {
+      fileSelectCache = {
+        key,
+        html: shown.map((f) => `<option value="${escapeHtml(f.rel)}">${escapeHtml(nameOf(f.rel))}</option>`).join("") + (overflow ? `<option value="" disabled>… ${overflow.toLocaleString()} more selected files (use the per-file Compare button or arrow keys)</option>` : "")
+      };
+    }
     if (rel && !inList) {
-      select.innerHTML = `<option value="${escapeHtml(rel)}" selected>${escapeHtml(nameOf(rel))}</option>` + options;
+      select.innerHTML = `<option value="${escapeHtml(rel)}" selected>${escapeHtml(nameOf(rel))}</option>` + fileSelectCache.html;
       return;
     }
-    select.innerHTML = options;
+    select.innerHTML = fileSelectCache.html;
     if (rel)
       select.value = rel;
   };
@@ -2581,7 +2625,7 @@ function createCompareView(actions) {
   };
   const formatDate = (mtime) => {
     if (!mtime)
-      return "Captured 2026-01-14 10:32";
+      return "";
     const d = new Date(mtime);
     const pad = (n) => String(n).padStart(2, "0");
     return `Captured ${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
@@ -2593,7 +2637,7 @@ function createCompareView(actions) {
     const pathText = data.rel;
     $("compareFacts").innerHTML = `
       <div class="meta-line-primary">${dimText} · ${escapeHtml(origExt)} · ${fmt(data.originalBytes)}</div>
-      <div class="meta-line-secondary">${escapeHtml(dateText)}</div>
+      ${dateText ? `<div class="meta-line-secondary">${escapeHtml(dateText)}</div>` : ""}
       <div class="meta-line-secondary" title="${escapeHtml(pathText)}">${escapeHtml(pathText)}</div>
     `;
   };
@@ -3004,6 +3048,7 @@ function createCompareView(actions) {
     activeFormat = state.currentFormat;
     panX = 0;
     panY = 0;
+    fileSelectCache = null;
     const files = fileList();
     const wanted = rel ?? state.compareRel;
     const chosen = rel ?? (wanted && files.some((f) => f.rel === wanted) ? wanted : files[0]?.rel);
@@ -3409,7 +3454,7 @@ function createRunView(actions) {
   }
   if (btnCopyFailed) {
     btnCopyFailed.addEventListener("click", () => {
-      const failed = state.activity.filter((f) => f.status === "failed");
+      const failed = state.failedActivity;
       if (!failed.length) {
         actions.toast("No failed files to copy.");
         return;
@@ -3481,7 +3526,7 @@ function createRunView(actions) {
     lastDockState = r.state;
   };
   const activityHtml = () => {
-    const list = showFailedOnly ? state.activity.filter((f) => f.status === "failed") : state.activity;
+    const list = showFailedOnly ? state.failedActivity : state.activity;
     if (!list.length) {
       return `<p class="empty-note" style="padding:14px">${showFailedOnly ? "No failed files recorded." : "Results appear here as files finish."}</p>`;
     }
@@ -3830,23 +3875,20 @@ var save = async () => {
 var schedulePreview = debounce(() => {
   refreshPreview();
 }, 180);
-var refreshPreview = async () => {
+var refreshPreview = async (persist = true) => {
   if (!state.tree)
     return;
   const seq = ++previewSeq;
   state.previewSeq = seq;
   state.previewBusy = true;
   try {
-    await save();
+    if (persist)
+      await save();
     const isCustomVideo = state.mediaMode === "video" && state.videoDestMode === "custom";
     const destVal = isCustomVideo ? input("destination").value.trim() || state.videoCustomDestination : undefined;
     const preview = await api("preview", {
       method: "POST",
-      body: {
-        policy: activePolicy(),
-        customDestination: destVal,
-        destination: destVal
-      }
+      body: persist ? { policy: activePolicy(), customDestination: destVal, destination: destVal } : { customDestination: destVal, destination: destVal }
     });
     if (seq !== previewSeq)
       return;
@@ -4007,6 +4049,8 @@ var renderRecentSources = (sources) => {
   }
 };
 var applySource = async (silent = false) => {
+  if (scanning)
+    return;
   const source = input("sourceRoot").value.trim();
   const previousSource = state.status?.sourceRoot ?? "";
   if (!source) {
@@ -4224,7 +4268,6 @@ var switchMediaMode = async (next) => {
     state.videoDestMode = vPolicy.destMode ?? "merge";
     state.videoCustomDestination = vStatus.customDestination ?? "";
     extEnabled = { ...vPolicy.extEnabled };
-    input("jobs").value = String(vPolicy.jobs ?? 1);
     updateJobsReadout();
     input("videoContainer").value = vPolicy.container ?? "mp4";
     input("videoMaxRes").value = String(vPolicy.maxResolution ?? 0);
@@ -4361,6 +4404,7 @@ var renderExtToggles = () => {
     const chip = document.createElement("button");
     chip.type = "button";
     chip.className = "ext-chip" + (enabled ? " on" : "") + (fileCount === 0 && state.tree ? " zero" : "");
+    chip.setAttribute("aria-pressed", String(enabled));
     chip.textContent = fileCount > 0 ? `.${ext} (${fileCount.toLocaleString()})` : `.${ext}`;
     chip.title = fileCount > 0 ? `${fileCount.toLocaleString()} files · ${fmt(bytes)} · ${enabled ? "Click to skip" : "Click to include"}` : `${enabled ? "Include" : "Skip"} .${ext} files (0 found)`;
     chip.addEventListener("click", () => {
@@ -4427,13 +4471,16 @@ var runEstimate = async () => {
     });
     state.lastEstimate = estimate;
     const ratio = estimate.ratio > 0 ? `${(1 / estimate.ratio).toFixed(1)}:1` : "—";
+    const unmeasured = estimate.method === "unmeasured" || estimate.unmeasured === true;
+    const methodLabel = estimate.method === "sampled" ? "Sampled encode" : unmeasured ? "Unmeasured (no sample succeeded)" : "Flat ratio";
+    const timeCell = unmeasured ? `<dt>Projected time</dt><dd class="mono">unknown${estimate.unmeasuredReason ? ` — ${escapeHtml(estimate.unmeasuredReason)}` : ""}</dd>` : `<dt>Projected time</dt><dd class="mono">${dur(estimate.projectedSeconds)}</dd>`;
     box.innerHTML = `<h4>Estimate <small>${estimate.sampleSize.toLocaleString()} files sampled · ${escapeHtml(state.formatSpecs[estimate.format]?.shortLabel ?? estimate.format)}</small></h4>
       <dl class="kv">
         <dt>Measured ratio</dt><dd class="mono">${ratio}</dd>
         <dt>Mean output</dt><dd class="mono">${fmt(estimate.meanOutputBytes)}</dd>
         <dt>Projected output</dt><dd class="mono">${fmt(estimate.projectedOutputBytes)}</dd>
-        <dt>Projected time</dt><dd class="mono">${dur(estimate.projectedSeconds)}</dd>
-        <dt>Method</dt><dd>${estimate.method === "sampled" ? "Sampled encode" : "Flat ratio"} · ${dur(estimate.durationMs / 1000)}</dd>
+        ${timeCell}
+        <dt>Method</dt><dd>${methodLabel} · ${dur(estimate.durationMs / 1000)}</dd>
       </dl>`;
     plan.render();
     await refreshPreview();
@@ -5035,11 +5082,24 @@ var boot = async () => {
       await runLifecycle.attach(status.liveJobId, true);
     }
     if (status.scanned) {
-      const scan = await api("scan", { method: "POST", body: {} });
-      library.setScan(scan, false);
-      renderRecentSources(scan.recentSources);
-      renderExtToggles();
-      await refreshPreview();
+      scanning = true;
+      $("btnScan").disabled = true;
+      $("btnScan").textContent = "Scanning…";
+      updateChrome();
+      try {
+        const scan = await api("scan", { method: "POST", body: {} });
+        library.setScan(scan, false);
+        renderRecentSources(scan.recentSources);
+        renderExtToggles();
+        await refreshPreview(false);
+      } catch (scanError) {
+        toast(formatError(scanError), "danger");
+      } finally {
+        scanning = false;
+        $("btnScan").disabled = false;
+        $("btnScan").textContent = "Scan";
+        updateChrome();
+      }
     } else if (status.sourceRoot) {
       plan.render();
       updateChrome();

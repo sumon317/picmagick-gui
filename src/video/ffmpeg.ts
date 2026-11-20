@@ -9,6 +9,7 @@ import {
   mkdirSync,
   readFileSync,
   readdirSync,
+  renameSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -18,7 +19,7 @@ import path from "node:path";
 
 import { BUNDLED_FFMPEG_DIR, FFMPEG_DIR } from "../appdirs.ts";
 import type { FormatSupport } from "../paths.ts";
-import { IS_LINUX, IS_WINDOWS } from "../platform.ts";
+import { IS_MACOS, IS_WINDOWS } from "../platform.ts";
 import { APP_VERSION } from "../version.ts";
 import {
   VIDEO_OUTPUT_FORMATS,
@@ -223,11 +224,18 @@ export function findFfmpeg(forceRefresh = false): FfmpegInfo {
     }
   }
 
+  if (IS_MACOS) {
+    for (const dir of ["/opt/homebrew/bin", "/usr/local/bin", "/opt/local/bin"]) {
+      if (existsSync(dir)) candidateDirs.push({ dir, managed: false });
+    }
+  }
+
   for (const { dir, managed } of candidateDirs) {
     const fPath = path.join(dir, FFMPEG_BIN);
     const pPath = path.join(dir, FFPROBE_BIN);
     if (existsSync(fPath) && existsSync(pPath)) {
       const version = parseFfmpegVersion(fPath);
+      if (version === "unknown") continue;
       const { formats, hwEncoders } = probeEncoders(fPath, version);
       cachedFfmpeg = {
         ffmpegPath: fPath,
@@ -329,6 +337,8 @@ export async function installLatestFfmpeg(): Promise<{ ok: boolean; path: string
   installState.message = "Downloading FFmpeg static release…";
 
   const archivePath = path.join(FFMPEG_DIR, path.basename(url));
+  const stagingDir = path.join(FFMPEG_DIR, `.staging-${Date.now()}-${process.pid}`);
+  let sink: ReturnType<ReturnType<typeof Bun.file>["writer"]> | null = null;
   try {
     await mkdir(FFMPEG_DIR, { recursive: true });
 
@@ -344,7 +354,7 @@ export async function installLatestFfmpeg(): Promise<{ ok: boolean; path: string
     const total = Number(res.headers.get("content-length")) || 0;
     installState.totalBytes = total;
 
-    const sink = Bun.file(archivePath).writer();
+    sink = Bun.file(archivePath).writer();
     const reader = res.body.getReader();
     let received = 0;
 
@@ -359,25 +369,19 @@ export async function installLatestFfmpeg(): Promise<{ ok: boolean; path: string
       }
     }
     await sink.end();
+    sink = null;
 
     installState.stage = "extracting";
     installState.percent = 100;
     installState.message = "Extracting FFmpeg package…";
 
-    // Prune older managed FFmpeg subdirectories so findFfmpeg picks the fresh install
-    try {
-      for (const ent of readdirSync(FFMPEG_DIR, { withFileTypes: true })) {
-        if (ent.isDirectory() && /^ffmpeg-/i.test(ent.name)) {
-          rmSync(path.join(FFMPEG_DIR, ent.name), { recursive: true, force: true });
-        }
-      }
-    } catch {
-      // ignore
-    }
+    // Extract into a staging directory first so a failed extraction never
+    // destroys a previously working managed FFmpeg installation.
+    await mkdir(stagingDir, { recursive: true });
 
     const tarCmd = getTarBinary();
     await new Promise<void>((resolve, reject) => {
-      const child = spawn(tarCmd, ["-xf", archivePath, "-C", FFMPEG_DIR], {
+      const child = spawn(tarCmd, ["-xf", archivePath, "-C", stagingDir], {
         windowsHide: true,
         stdio: "ignore",
       });
@@ -395,17 +399,43 @@ export async function installLatestFfmpeg(): Promise<{ ok: boolean; path: string
       });
     });
 
-    if (!IS_WINDOWS) {
-      try {
-        for (const ent of readdirSync(FFMPEG_DIR, { withFileTypes: true, recursive: true })) {
-          if (ent.isFile() && (ent.name === "ffmpeg" || ent.name === "ffprobe")) {
-            const p = path.join(ent.parentPath || FFMPEG_DIR, ent.name);
-            chmodSync(p, 0o755);
-          }
-        }
-      } catch {
-        // best effort
+    // Verify extracted binaries exist (and are executable on Linux) before swapping.
+    let stagedFfmpeg: string | null = null;
+    let stagedFfprobe: string | null = null;
+    for (const ent of readdirSync(stagingDir, { withFileTypes: true, recursive: true })) {
+      if (!ent.isFile()) continue;
+      const p = path.join(ent.parentPath || stagingDir, ent.name);
+      if (ent.name === FFMPEG_BIN) {
+        if (!IS_WINDOWS) try { chmodSync(p, 0o755); } catch {}
+        stagedFfmpeg = p;
+      } else if (ent.name === FFPROBE_BIN) {
+        if (!IS_WINDOWS) try { chmodSync(p, 0o755); } catch {}
+        stagedFfprobe = p;
       }
+    }
+    if (!stagedFfmpeg || !stagedFfprobe || parseFfmpegVersion(stagedFfmpeg) === "unknown") {
+      throw new Error("Extracted archive did not contain a working ffmpeg + ffprobe pair.");
+    }
+
+    // Move staged entries into FFMPEG_DIR and prune older managed ffmpeg-* dirs.
+    const stagedEntries = readdirSync(stagingDir, { withFileTypes: true });
+    const installedNames = new Set(stagedEntries.map((e) => e.name));
+    const oldDirs: string[] = [];
+    for (const ent of readdirSync(FFMPEG_DIR, { withFileTypes: true })) {
+      if (ent.isDirectory() && /^ffmpeg-/i.test(ent.name) && !installedNames.has(ent.name)) {
+        oldDirs.push(path.join(FFMPEG_DIR, ent.name));
+      }
+    }
+    for (const ent of stagedEntries) {
+      const src = path.join(stagingDir, ent.name);
+      const dst = path.join(FFMPEG_DIR, ent.name);
+      if (existsSync(dst)) {
+        rmSync(dst, { recursive: true, force: true });
+      }
+      renameSync(src, dst);
+    }
+    for (const old of oldDirs) {
+      rmSync(old, { recursive: true, force: true });
     }
 
     cachedFfmpeg = null;
@@ -420,6 +450,10 @@ export async function installLatestFfmpeg(): Promise<{ ok: boolean; path: string
     installState.message = `Installation failed: ${(err as Error).message}`;
     throw err;
   } finally {
+    if (sink) {
+      try { await sink.end(); } catch { /* ignore */ }
+    }
     rmSync(archivePath, { force: true });
+    rmSync(stagingDir, { recursive: true, force: true });
   }
 }

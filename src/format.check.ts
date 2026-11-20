@@ -510,6 +510,22 @@ await check("sync follows the selected format and reports old outputs as orphans
   }
 });
 
+await check("parseFormatSupport handles modular 3-column Linux rows", () => {
+  const modular = [
+    "     AVIF  HEIC  rw+   AV1 Image File Format (1.17.6)",
+    "     HEIC  HEIC  r--   High Efficiency Image File Format (1.17.6)",
+    "      JXL* JXL   rw+   JPEG XL (ISO/IEC 18181) (libjxl 0.10.2)",
+  ].join("\n");
+  const support = parseFormatSupport(modular);
+  assert.equal(support.avif.mode, "rw+");
+  assert.equal(support.avif.writable, true);
+  assert.equal(support.heic.mode, "r--");
+  assert.equal(support.heic.writable, false);
+  assert.equal(support.jxl.mode, "rw+");
+  assert.equal(support.jxl.writable, true);
+  assert.equal(support.jxl.detail, "libjxl 0.10.2");
+});
+
 await check("format check files stay readable", async () => {
   // Guards against a future edit turning this file into a syntax-only check.
   assert.equal((await readFile(new URL(import.meta.url))).length > 0, true);

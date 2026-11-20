@@ -11,6 +11,10 @@ coverage/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# IDE / editor internals (worktrees may carry these around untracked)
+.idea/
+.vscode/
 *.zip
 *.7z
 

@@ -118,9 +118,26 @@ export function createAuditView(actions: ViewActions): AuditViewController {
   const renderDuplicates = (data: DuplicatesResponse): void => {
     dupeData = data;
     $("auditMeta").textContent = data.groupCount ? `${data.groupCount} groups` : "3 reports";
+    // Honesty: a capped hash pass can miss duplicates entirely, so this warning
+    // must be visible even when groupCount === 0 (the zero-group early return
+    // used to hide it). `unhashedGroups` is a newer server field; when the
+    // producer is absent degrade to "n/a" rather than dropping the field.
+    const hashBudgetWarning = data.truncated === true
+      ? `<p class="warn">Hash budget reached: only the first ${(data.candidateCount ?? 0).toLocaleString()} same-size candidates were hashed; larger files on disk were not compared, ${data.unhashedGroups != null ? data.unhashedGroups.toLocaleString() : "n/a"} group(s) unhashed.</p>`
+      : "";
+    // Separate honesty signal: unreadable/locked files that could not be hashed
+    // at all. Rendered independently of `truncated`, so a library below the
+    // hash cap (<6000 candidates) with read failures still surfaces the
+    // incompleteness instead of a bare "No duplicates found".
+    const hashErrors = data.hashErrors ?? 0;
+    const hashErrorsWarning = hashErrors > 0
+      ? `<p class="warn">${hashErrors.toLocaleString()} file(s) could not be hashed (unreadable or locked) — results may be incomplete.</p>`
+      : "";
     if (!data.groupCount) {
       $("dupeBox").innerHTML = `<div class="result-box">
         <h4>Duplicates <small>${data.hashedFiles.toLocaleString()} hashed</small></h4>
+        ${hashBudgetWarning}
+        ${hashErrorsWarning}
         <p class="ok">No duplicates found in ${data.hashedFiles.toLocaleString()} hashed files.</p>
         <div class="drawer-actions"><button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button></div>
       </div>`;
@@ -138,7 +155,13 @@ export function createAuditView(actions: ViewActions): AuditViewController {
         <div class="dupe-head"><span>${escapeHtml(base(group.members[0].rel))}</span><span class="muted">${group.members.length} copies · ${fmt(group.size)}</span></div>
         <div class="dupe-members">${group.members.slice(0, 3).map((m) => escapeHtml(base(m.rel))).join(" · ")}${group.members.length > 3 ? " …" : ""}${group.spreadAcrossFolders ? " · across folders" : ""}</div>
       </div>`).join("")}
-      ${data.groupCount > groups.length ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>` : ""}
+      ${data.groupCount > data.groups.length
+        ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups (response capped at ${data.groups.length.toLocaleString()}).</p>`
+        : data.groupCount > groups.length
+          ? `<p class="muted">Showing the first ${groups.length} of ${data.groupCount.toLocaleString()} groups.</p>`
+          : ""}
+      ${hashBudgetWarning}
+      ${hashErrorsWarning}
       <div class="drawer-actions">
         <button class="btn sm" type="button" data-exclude-dupes="${totalRemovable}">Exclude ${totalRemovable.toLocaleString()} duplicates</button>
         <button class="btn ghost sm" type="button" data-audit-run="duplicates">Run again</button>
@@ -282,7 +305,9 @@ export function createAuditView(actions: ViewActions): AuditViewController {
         try {
           const res = await api<{ removed: number; bytesFreed: number }>("sync/clean-orphans", {
             method: "POST",
-            body: {},
+            // The server gate requires confirm === true (server.ts / video/routes.ts);
+            // without it the destructive cleanup is refused with HTTP 409.
+            body: { confirm: true },
           });
           actions.toast(`Removed ${res.removed.toLocaleString()} orphan files, freed ${fmt(res.bytesFreed)}.`, "success");
           void runSync();

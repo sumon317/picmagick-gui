@@ -5,7 +5,7 @@ import { access, stat } from "node:fs/promises";
 import { constants } from "node:fs";
 import path from "node:path";
 import type { HealthCheck } from "../health.ts";
-import { freeSpace } from "../paths.ts";
+import { assertDestinationSafe, freeSpace } from "../paths.ts";
 import { findFfmpeg, type FfmpegInfo } from "./ffmpeg.ts";
 import { VIDEO_FORMAT_SPECS, type VideoOutputFormat } from "./formats.ts";
 
@@ -58,6 +58,7 @@ export async function runVideoHealthCheck(
 
   try {
     const st = await stat(sourceRoot);
+    if (st.isDirectory()) await access(sourceRoot, constants.R_OK);
     checks.push({
       id: "source",
       label: "Source readable",
@@ -74,40 +75,69 @@ export async function runVideoHealthCheck(
   }
 
   try {
-    const st = await stat(effectiveDestination);
-    if (!st.isDirectory()) throw new Error("not a directory");
-    await access(effectiveDestination, constants.W_OK);
-    checks.push({
-      id: "dest",
-      label: "Output writable",
-      status: "ok",
-      detail: effectiveDestination,
-    });
+    assertDestinationSafe(sourceRoot, effectiveDestination);
   } catch (err) {
-    let ancestor = path.dirname(path.resolve(effectiveDestination));
-    while (ancestor && ancestor !== path.dirname(ancestor)) {
-      try {
-        await stat(ancestor);
-        break;
-      } catch {
-        ancestor = path.dirname(ancestor);
-      }
-    }
-    let parentWritable = false;
-    try {
-      await access(ancestor, constants.W_OK);
-      parentWritable = true;
-    } catch {
-      // not writable
-    }
     checks.push({
-      id: "dest",
-      label: "Output writable",
-      status: parentWritable ? "warn" : "fail",
-      detail: parentWritable
-        ? `${effectiveDestination} - will be created (${(err as Error).message.slice(0, 60)})`
-        : `${effectiveDestination} - parent folder "${ancestor}" is not writable`,
+      id: "dest-safe",
+      label: "Output safety",
+      status: "fail",
+      detail: (err as Error).message,
     });
+  }
+
+  try {
+    const st = await stat(effectiveDestination);
+    if (!st.isDirectory()) {
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: "fail",
+        detail: `${effectiveDestination} is a file, not a directory`,
+      });
+    } else {
+      await access(effectiveDestination, constants.W_OK);
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: "ok",
+        detail: effectiveDestination,
+      });
+    }
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") {
+      let ancestor = path.dirname(path.resolve(effectiveDestination));
+      while (ancestor && ancestor !== path.dirname(ancestor)) {
+        try {
+          await stat(ancestor);
+          break;
+        } catch {
+          ancestor = path.dirname(ancestor);
+        }
+      }
+      let parentWritable = false;
+      try {
+        await access(ancestor, constants.W_OK);
+        parentWritable = true;
+      } catch {
+        // not writable
+      }
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: parentWritable ? "warn" : "fail",
+        detail: parentWritable
+          ? `${effectiveDestination} - will be created`
+          : `${effectiveDestination} - parent folder "${ancestor}" is not writable`,
+      });
+    } else {
+      checks.push({
+        id: "dest",
+        label: "Output writable",
+        status: "fail",
+        detail: `${effectiveDestination} - not writable (${(err as Error).message.slice(0, 60)})`,
+      });
+    }
   }
 
   const free = await freeSpace(effectiveDestination);

@@ -9,9 +9,10 @@
 
 export const IS_WINDOWS = process.platform === "win32";
 export const IS_LINUX = process.platform === "linux";
+export const IS_MACOS = process.platform === "darwin";
 
-/** Windows paths compare case-insensitively; Linux paths do not. */
-export const CASE_INSENSITIVE = IS_WINDOWS;
+/** Windows and (default) macOS volumes compare case-insensitively; Linux paths do not. */
+export const CASE_INSENSITIVE = IS_WINDOWS || IS_MACOS;
 
 /** Native separator for values in `ScannedFile.rel` and `dir`. */
 export const REL_SEP = IS_WINDOWS ? "\\" : "/";

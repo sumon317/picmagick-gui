@@ -32,12 +32,15 @@ import {
 import {
   applyVideoPolicy,
   DEFAULT_VIDEO_POLICY,
+  defaultVideoDestination,
   normaliseVideoPolicy,
   resolveVideoDestination,
   videoOutputPathFor,
   type VideoDecision,
   type VideoPolicy,
 } from "./video/policy.ts";
+import { runVideoHealthCheck } from "./video/health.ts";
+import { buildVideoDateReport } from "./video/meta.ts";
 import { analyseVideoSync } from "./video/sync.ts";
 
 let failures = 0;
@@ -502,6 +505,42 @@ await check("Sync and Undo in 'merge' mode never flag or delete compressed photo
   } finally {
     await rm(root, { recursive: true, force: true });
   }
+});
+
+await check("defaultVideoDestination preserves filesystem roots without mangling", () => {
+  assert.equal(defaultVideoDestination("C:\\", "av1"), "C:\\-av1");
+  assert.equal(defaultVideoDestination("/", "av1"), "/-av1");
+  assert.equal(defaultVideoDestination("D:\\Videos\\", "hevc"), "D:\\Videos-hevc");
+});
+
+await check("runVideoHealthCheck fails (not warns) when destination is an existing file", async () => {
+  const root = await mkdtemp(path.join(tmpdir(), "picmagick-video-health-"));
+  try {
+    const srcDir = path.join(root, "src");
+    const destFile = path.join(root, "not-a-dir");
+    await mkdir(srcDir, { recursive: true });
+    await writeFile(destFile, "blocking-file");
+
+    const report = await runVideoHealthCheck(srcDir, destFile, 1024, "av1");
+    const destCheck = report.checks.find((c) => c.id === "dest");
+    assert.ok(destCheck);
+    assert.equal(destCheck.status, "fail");
+    assert.equal(report.canRun, false);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+await check("buildVideoDateReport ignores invalid 0000 years in byYear tally", () => {
+  const report = buildVideoDateReport([
+    { path: "/v/bad.mp4", ok: true, dateOriginal: "0000:00:00 00:00:00" },
+    { path: "/v/good.mp4", ok: true, dateOriginal: "2025:06:15 12:00:00" },
+    { path: "/v/nodate.mp4", ok: true },
+  ]);
+  assert.equal(report.withExif, 2);
+  assert.equal(report.undated.length, 1);
+  assert.equal(report.byYear["0000"], undefined);
+  assert.equal(report.byYear["2025"], 1);
 });
 
 console.log(failures ? `\n${failures} video check(s) failed` : "\nvideo OK");

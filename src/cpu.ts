@@ -19,16 +19,24 @@ export function getTotalCpus(): number {
  *   70% -> 5 cores -> mask 0x1Fn (0b00011111)
  *   50% -> 4 cores -> mask 0x0Fn (0b00001111)
  *  100% -> 8 cores -> mask 0xFFn (0b11111111)
+ *
+ * The percentage always applies to the REAL thread count, not to a clamped
+ * figure (128 threads at 50% = 64 threads, not 32). A group-affinity mask is
+ * 64-bit wide, so >64-thread boxes consciously get the full first group.
  */
 export function calculateAffinityMask(percent: number, rawTotalCpus = getTotalCpus()): bigint {
   const safeCpus = Number.isFinite(rawTotalCpus) ? rawTotalCpus : 1;
-  const totalCpus = Math.max(1, Math.min(64, Math.floor(safeCpus)));
+  const totalCpus = Math.max(1, Math.floor(safeCpus));
   const safePct = Number.isFinite(percent) ? percent : 70;
   const pct = Math.max(10, Math.min(100, Math.round(safePct) || 70));
   if (pct >= 100) {
-    return (1n << BigInt(totalCpus)) - 1n;
+    const width = Math.min(totalCpus, 64);
+    return (1n << BigInt(width)) - 1n;
   }
-  const allowed = Math.max(1, Math.min(totalCpus, Math.floor(totalCpus * (pct / 100))));
+  const allowed = Math.max(
+    1,
+    Math.min(totalCpus, 64, Math.floor(totalCpus * (pct / 100))),
+  );
   return (1n << BigInt(allowed)) - 1n;
 }
 
@@ -165,47 +173,114 @@ export function resumeProcess(pid: number | undefined): boolean {
 }
 
 /**
- * Applies CPU affinity and background process priority to a running process.
- * Can be called repeatedly on active processes to adjust CPU limits mid-run.
+ * Bounded wait for the Linux `taskset` helper. A missing or hung binary must
+ * never stall the event loop (and therefore SSE / UI) for the old
+ * 10 s × active-PID worst case of the removed spawnSync() call.
  */
-export function applyProcessCpuLimit(pid: number | undefined, percent: number): boolean {
-  if (!pid || pid <= 0) return false;
-  const clampedPct = Number.isFinite(percent) ? Math.max(10, Math.min(100, Math.round(percent))) : 70;
-  let success = false;
+const TASKSET_TIMEOUT_MS = 2_000;
 
-  if (k32) {
-    try {
-      const mask = calculateAffinityMask(clampedPct);
-      const handle = k32.symbols.OpenProcess(PROCESS_AFFINITY_ACCESS, false, pid);
-      if (handle) {
-        success = Boolean(k32.symbols.SetProcessAffinityMask(handle, mask));
-        k32.symbols.CloseHandle(handle);
-      }
-    } catch {
-      // Fallback silently if OS denies affinity change
-    }
-  }
-
-  if (process.platform === "linux") {
-    try {
-      const total = getTotalCpus();
-      const allowed = Math.max(1, Math.min(total, Math.floor(total * (clampedPct / 100))));
-      const child = spawn("taskset", ["-pc", `0-${allowed - 1}`, String(pid)], { stdio: "ignore" });
-      child.on("error", () => {});
-      child.unref();
-      success = true;
-    } catch {
-      // Fallback silently if taskset is not installed
-    }
-  }
-
+/** Windows affinity via kernel32; returns false on non-Windows platforms. */
+function setWindowsAffinity(pid: number, percent: number): boolean {
+  if (!k32) return false;
   try {
-    // Set priority class to BELOW_NORMAL so the system stays responsive
+    const mask = calculateAffinityMask(percent);
+    const handle = k32.symbols.OpenProcess(PROCESS_AFFINITY_ACCESS, false, pid);
+    if (handle) {
+      const ok = Boolean(k32.symbols.SetProcessAffinityMask(handle, mask));
+      k32.symbols.CloseHandle(handle);
+      return ok;
+    }
+  } catch {
+    // Fallback silently if OS denies affinity change
+  }
+  return false;
+}
+
+/** BELOW_NORMAL priority is best-effort on every platform. */
+function setBackgroundPriority(pid: number): void {
+  try {
     os.setPriority(pid, os.constants.priority.PRIORITY_BELOW_NORMAL);
   } catch {
     // Ignore priority errors
   }
+}
 
+/**
+ * CPU-B fix: non-blocking `taskset -pc` with the original affinity semantics.
+ * Resolves `true` only when taskset actually applied the affinity (exit 0);
+ * `false` on ENOENT, timeout, or non-zero exit. A bounded timer kills a hung
+ * helper, and every failure is logged so a silently missing taskset is
+ * observable instead of making the UI claim success.
+ */
+function tasksetAffinityAsync(pid: number, percent: number): Promise<boolean> {
+  const total = getTotalCpus();
+  const allowed = Math.max(1, Math.min(total, Math.floor(total * (percent / 100))));
+  return new Promise<boolean>((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn("taskset", ["-pc", `0-${allowed - 1}`, String(pid)], { stdio: "ignore" });
+    } catch (err) {
+      console.warn(`[cpu] taskset spawn failed for pid ${pid}:`, err);
+      resolve(false);
+      return;
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let settled = false;
+    const finish = (ok: boolean, why?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      if (why) console.warn(`[cpu] taskset ${why} for pid ${pid}`);
+      resolve(ok);
+    };
+    timer = setTimeout(() => {
+      try { child.kill(); } catch { /* already gone */ }
+      finish(false, "timed out");
+    }, TASKSET_TIMEOUT_MS);
+    child.once("error", (err) => {
+      console.warn(`[cpu] taskset unavailable for pid ${pid}:`, err);
+      finish(false);
+    });
+    child.once("close", (code) => finish(code === 0, code === 0 ? undefined : `exited ${code}`));
+  });
+}
+
+/**
+ * Applies CPU affinity and background process priority to a running process.
+ * Can be called repeatedly on active processes to adjust CPU limits mid-run.
+ *
+ * Kept synchronous for spawn-side callers that cannot await (convert.ts,
+ * estimate.ts, video/*, and the platform check). On Linux the taskset work is
+ * now fire-and-forget with a bounded timer + error logging, so a missing or
+ * hung taskset can never block the event loop. Callers that need the real
+ * result use applyProcessCpuLimitAsync() instead.
+ */
+export function applyProcessCpuLimit(pid: number | undefined, percent: number): boolean {
+  if (!pid || pid <= 0) return false;
+  const clampedPct = Number.isFinite(percent) ? Math.max(10, Math.min(100, Math.round(percent))) : 70;
+  const success = setWindowsAffinity(pid, clampedPct);
+  if (process.platform === "linux") {
+    // Non-blocking: result checking + warning happen inside the helper. The
+    // boolean return stays synchronous (false here = "not reported applied").
+    void tasksetAffinityAsync(pid, clampedPct);
+  }
+  setBackgroundPriority(pid);
+  return success;
+}
+
+/**
+ * Async counterpart of applyProcessCpuLimit(): resolves only after the Linux
+ * taskset helper settles (or its bounded timer fires), so callers can coalesce
+ * per-PID updates with Promise.all() without serializing the waits.
+ */
+export async function applyProcessCpuLimitAsync(pid: number | undefined, percent: number): Promise<boolean> {
+  if (!pid || pid <= 0) return false;
+  const clampedPct = Number.isFinite(percent) ? Math.max(10, Math.min(100, Math.round(percent))) : 70;
+  let success = setWindowsAffinity(pid, clampedPct);
+  if (process.platform === "linux") {
+    success = await tasksetAffinityAsync(pid, clampedPct);
+  }
+  setBackgroundPriority(pid);
   return success;
 }
 

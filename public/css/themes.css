@@ -74,7 +74,7 @@
   --selection: #f0dfc4;
   --strike: #b6a68f;
   --badge-bg: #e9decc;
-  --badge-raw-bg: #f0dfbb;
+  --badge-raw-bg: #f7ead3;
   --badge-dead-bg: #f2dad4;
   --paused-bg: #f7ecd0;
   --paused-line: #c2982c;
@@ -110,7 +110,7 @@
   --violet: #b48ead;
   --good: #a3be8c;
   --warn: #ebcb8b;
-  --bad: #bf616a;
+  --bad: #f4a9b1;
   --hover-bg: #3b4354;
   --hover-line: #556176;
   --row-hover: #333b48;

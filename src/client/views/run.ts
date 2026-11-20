@@ -58,7 +58,7 @@ export function createRunView(actions: ViewActions): RunViewController {
 
   if (btnCopyFailed) {
     btnCopyFailed.addEventListener("click", () => {
-      const failed = state.activity.filter((f) => f.status === "failed");
+      const failed = state.failedActivity;
       if (!failed.length) {
         actions.toast("No failed files to copy.");
         return;
@@ -163,9 +163,7 @@ export function createRunView(actions: ViewActions): RunViewController {
   };
 
   const activityHtml = (): string => {
-    const list = showFailedOnly
-      ? state.activity.filter((f) => f.status === "failed")
-      : state.activity;
+    const list = showFailedOnly ? state.failedActivity : state.activity;
     if (!list.length) {
       return `<p class="empty-note" style="padding:14px">${showFailedOnly ? "No failed files recorded." : "Results appear here as files finish."}</p>`;
     }

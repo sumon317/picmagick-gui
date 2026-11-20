@@ -96,7 +96,7 @@ mkdirSync(DATA_DIR, { recursive: true });
 // Migrate any legacy picmagick-gui binaries and manifests to Compakta
 try {
   const legacyCandidates = getLegacyDataCandidates(Utils.paths.appData);
-  migrateLegacyData(DATA_DIR, legacyCandidates);
+  void migrateLegacyData(DATA_DIR, legacyCandidates).catch(err => console.warn("[compakta] Startup legacy data migration notice:", err));
 } catch (err) {
   console.warn("[compakta] Startup legacy data migration notice:", err);
 }

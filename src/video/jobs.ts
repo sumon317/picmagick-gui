@@ -4,7 +4,13 @@
  */
 import { EventEmitter } from "node:events";
 import type { FileResult } from "../convert.ts";
-import { applyProcessCpuLimit, resumeProcess, suspendProcess, acquireSleepInhibit, releaseSleepInhibit } from "../cpu.ts";
+import {
+  applyProcessCpuLimitAsync,
+  resumeProcess,
+  suspendProcess,
+  acquireSleepInhibit,
+  releaseSleepInhibit,
+} from "../cpu.ts";
 import type { OutputFormat } from "../formats.ts";
 import type { JobState, Progress } from "../jobs.ts";
 import { writeManifest } from "../manifest.ts";
@@ -52,6 +58,7 @@ export class VideoJob extends EventEmitter {
 
   private liveJobs = 1;
   private getLimit = () => this.liveJobs;
+  private wakeDispatch: (() => void) | null = null;
 
   private liveCpuLimit = 70;
   private activePids = new Set<number>();
@@ -72,13 +79,17 @@ export class VideoJob extends EventEmitter {
 
   setJobs(n: number) {
     this.liveJobs = Math.max(1, Math.min(Math.round(n) || 1, 8));
+    this.wakeDispatch?.();
     return this.liveJobs;
   }
 
   setCpuLimit(n: number) {
     this.liveCpuLimit = Math.max(10, Math.min(Math.round(n) || 70, 100));
-    for (const pid of this.activePids) {
-      applyProcessCpuLimit(pid, this.liveCpuLimit);
+    const pids = [...this.activePids];
+    if (pids.length > 0) {
+      void Promise.all(
+        pids.map((pid) => applyProcessCpuLimitAsync(pid, this.liveCpuLimit)),
+      ).catch((err) => console.warn(`[video-jobs] CPU limit update failed:`, err));
     }
     return this.liveCpuLimit;
   }
@@ -228,7 +239,28 @@ export class VideoJob extends EventEmitter {
     return true;
   }
 
-  cancel() {
+  private async persistResultsManifest(o: VideoStartOptions): Promise<string | undefined> {
+    if (this.results.length === 0) return undefined;
+    const id =
+      `video-run-${new Date().toISOString().replace(/[:.]/g, "-")}-${Math.random().toString(36).slice(2, 6)}`;
+    await writeManifest(
+      o.effectiveDestination,
+      id,
+      {
+        createdAt: Date.now(),
+        sourceRoot: o.sourceRoot,
+        destination: o.effectiveDestination,
+        quality: [o.policy.quality],
+        heicSpeed: o.policy.speed,
+        outputFormat: o.policy.outputFormat as unknown as OutputFormat,
+        tool: "compakta-video",
+      },
+      this.results,
+    );
+    return id;
+  }
+
+  async cancel(): Promise<boolean> {
     if (this.sleepHeld) {
       releaseSleepInhibit();
       this.sleepHeld = false;
@@ -244,13 +276,18 @@ export class VideoJob extends EventEmitter {
 
     if (this.state === "paused" && this.activePids.size === 0) {
       this.state = "cancelled";
+      const manifestId = this.opts
+        ? await this.persistResultsManifest(this.opts).catch(() => undefined)
+        : undefined;
       const finishEvt: Progress = {
         type: "finish",
         at: Date.now(),
         jobId: this.id,
-        manifestId: undefined,
+        manifestId,
         summary: this.summary(this.totals.bytes, "cancelled"),
-        message: "Paused video run discarded. Completed files remain on disk.",
+        message: manifestId
+          ? "Paused video run discarded. Completed files remain on disk (undoable)."
+          : "Paused video run discarded. Completed files remain on disk.",
       };
       this.lastTerminalEvent = finishEvt;
       this.emit("progress", finishEvt);
@@ -311,6 +348,7 @@ export class VideoJob extends EventEmitter {
           jobs: o.jobs,
           cpuLimit: this.liveCpuLimit,
           getLimit: this.getLimit,
+          onWake: (wake) => { this.wakeDispatch = wake; },
           getCpuLimit: this.getCpuLimit,
           onChildSpawn: (pid) => this.activePids.add(pid),
           onChildExit: (pid) => this.activePids.delete(pid),
@@ -325,10 +363,10 @@ export class VideoJob extends EventEmitter {
           },
           onResult: (r) => {
             this.inFlight--;
-            this.finished.add(r.rel);
-            this.totals.bytes += r.outBytes;
-            this.totals.inBytes += r.inBytes;
             if (r.status !== "cancelled") {
+              this.finished.add(r.rel);
+              this.totals.bytes += r.outBytes;
+              this.totals.inBytes += r.inBytes;
               this.done++;
               this.totals[
                 r.status === "converted"
@@ -345,6 +383,7 @@ export class VideoJob extends EventEmitter {
         },
         this.shouldStop,
       );
+      this.wakeDispatch = null;
 
       if (this.pauseRequested && !this.controller.signal.aborted && this.done < this.total) {
         if (this.started > 0) {
@@ -374,35 +413,28 @@ export class VideoJob extends EventEmitter {
       this.state = cancelled ? "cancelled" : "done";
       this.results = [...this.results, ...result.results];
 
-      let manifestId: string | undefined;
-      if (!cancelled) {
-        manifestId = `video-run-${new Date().toISOString().replace(/[:.]/g, "-")}`;
-        await writeManifest(
-          o.effectiveDestination,
-          manifestId,
-          {
-            createdAt: Date.now(),
-            sourceRoot: o.sourceRoot,
-            destination: o.effectiveDestination,
-            quality: [o.policy.quality],
-            heicSpeed: o.policy.speed,
-            outputFormat: o.policy.outputFormat as unknown as OutputFormat,
-            tool: "compakta-video",
-          },
-          this.results,
-        );
-      }
+      // Persist a manifest covering every completed video — including on a
+      // cancelled run so finished outputs stay safely undoable.
+      const manifestId = await this.persistResultsManifest(o).catch(() => undefined);
 
       const finishEvt: Progress = {
         type: "finish",
         at: Date.now(),
         jobId: this.id,
         manifestId,
-        summary: this.summary(this.totals.bytes, cancelled ? "cancelled" : undefined),
+        summary: this.summary(
+          this.totals.bytes,
+          cancelled
+            ? "cancelled"
+            : this.done > 0 && this.totals.failed === this.done
+              ? "every video failed — check the FFmpeg panel"
+              : undefined,
+        ),
       };
       this.lastTerminalEvent = finishEvt;
       this.emit("progress", finishEvt);
     } catch (err) {
+      this.wakeDispatch = null;
       this.state = "failed";
       const errEvt: Progress = {
         type: "error",

@@ -8,7 +8,6 @@ import { existsSync, readdirSync } from "node:fs";
 import { readdir, rename, rm, stat } from "node:fs/promises";
 import { homedir } from "node:os";
 import path from "node:path";
-import { fileURLToPath } from "node:url";
 import { spawn } from "node:child_process";
 
 import { scanLibrary, type ScanResult, type ScannedFile } from "./scan.ts";
@@ -21,7 +20,7 @@ import {
   isOutputFormat, qualityDisplay, sourceArgFor, type OutputFormat,
 } from "./formats.ts";
 import {
-  findMagick, assertDestinationSafe, freeSpace, ensureDir, type MagickInfo,
+  findMagick, assertDestinationSafe, freeSpace, ensureDir, dirExists, type MagickInfo,
 } from "./paths.ts";
 import { estimateFromSample, type Estimate } from "./estimate.ts";
 import { findDuplicates, type DedupeResult } from "./dedupe.ts";
@@ -32,13 +31,14 @@ import { runHealthCheck, type HealthReport } from "./health.ts";
 import { Job, getJob, liveJob, pausedJob, newJob, manifestsFor, undoManifest } from "./jobs.ts";
 import { analyseSync, cleanOrphans, pendingOnly, type SyncReport } from "./sync.ts";
 import { formatBytes, runPool } from "./convert.ts";
-import { checkForUpdate, installLatest, installProgress } from "./imagemagick.ts";
+import { checkForUpdate, installLatest, installProgress, isInstallInProgress } from "./imagemagick.ts";
 import {
   applyAppUpdate,
   checkAppUpdate,
   dismissAppUpdate,
   downloadAppUpdate,
   getAppUpdateProgress,
+  setApplyBusyGuard,
 } from "./app-update.ts";
 import { CASE_INSENSITIVE, IS_LINUX, IS_WINDOWS, pathKey, REL_SEP } from "./platform.ts";
 import { PREVIEW_CACHE_DIR, PUBLIC_DIR } from "./appdirs.ts";
@@ -47,6 +47,7 @@ import {
   currentVideoPreview,
   handleVideoApi,
   isVideoJobActive,
+  isVideoRunStarting,
   resetVideoScanState,
   type SharedServerBridge,
 } from "./video/routes.ts";
@@ -141,7 +142,13 @@ const videoBridge: SharedServerBridge = {
 };
 
 function requireMagick(): MagickInfo {
-  if (!state.magick) state.magick = findMagick();
+  if (!state.magick) {
+    try {
+      state.magick = findMagick();
+    } catch (err) {
+      throw new HttpError(400, singleLine((err as Error).message));
+    }
+  }
   return state.magick;
 }
 
@@ -219,6 +226,84 @@ const json = (data: unknown, status = 200) =>
     status,
     headers: { "content-type": "application/json; charset=utf-8" },
   });
+
+/**
+ * INSV-2/FS-01: every request body is JSON, size-capped, and non-negotiable.
+ * A missing or lying content-length only delays the verdict: the streamed
+ * bytes are counted too, and an oversized stream is cut off before it can
+ * fill the heap. Wrong content-type is 415; oversized is 413; junk JSON is 400.
+ */
+const MAX_BODY_BYTES = 2 * 1024 * 1024;
+
+export async function readBody<T>(req: Request): Promise<T> {
+  const ct = req.headers.get("content-type") ?? "";
+  if (ct && !/^application\/([a-z0-9.+-]+\+)?json\b/i.test(ct)) {
+    throw new HttpError(415, "Content-Type must be application/json.");
+  }
+  const declared = Number(req.headers.get("content-length") ?? "");
+  if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+    throw new HttpError(413, `Body too large (max ${formatBytes(MAX_BODY_BYTES)}).`);
+  }
+  const reader = req.body?.getReader();
+  if (!reader) throw new HttpError(400, "Malformed JSON body.");
+  const chunks: Uint8Array[] = [];
+  let size = 0;
+  for (;;) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    size += value.byteLength;
+    if (size > MAX_BODY_BYTES) {
+      try { await reader.cancel(); } catch { /* already closing */ }
+      throw new HttpError(413, `Body too large (max ${formatBytes(MAX_BODY_BYTES)}).`);
+    }
+    chunks.push(value);
+  }
+  const raw = new Uint8Array(size);
+  let at = 0;
+  for (const chunk of chunks) { raw.set(chunk, at); at += chunk.byteLength; }
+  try { return JSON.parse(new TextDecoder().decode(raw)) as T; }
+  catch { throw new HttpError(400, "Malformed JSON body."); }
+}
+
+/** INSV-1/FS-04: stderr lines must stay single-line (NTFS allows \r\n in paths). */
+export function singleLine(s: unknown): string {
+  return String(s).replace(/[\r\n]+/g, " | ");
+}
+
+/**
+ * INSV-1/FS-04: destination validations are user-input errors. Wrapping the
+ * assert keeps them HTTP 400 (with the caller-supplied paths echoed back to
+ * the caller who supplied them) instead of a 500 that leaks internal roots.
+ */
+export function safeDestination(source: string, destination: string): void {
+  try { assertDestinationSafe(source, destination); }
+  catch (err) { throw new HttpError(400, singleLine((err as Error).message)); }
+}
+
+/**
+ * INSV-3: `Number()` coercion with a fallback for junk — JSON cannot carry
+ * NaN, but it can carry `"abc"`, strings, nulls; pool sizing must never go
+ * NaN into a spawn loop.
+ */
+export function clampInt(v: unknown, dflt: number, min: number, max: number): number {
+  const n = Math.round(Number(v));
+  return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt;
+}
+
+/**
+ * FS-05: heavy walks (full library scans, sample encodes, hashing sweeps,
+ * ffprobe batches) run one at a time per kind, or two overlapping requests
+ * thrash the disk and the last-completed one silently wins a race the user
+ * never asked for. Released in `finally` so a failed walk cannot wedge the
+ * next one.
+ */
+const busy: Set<string> = new Set();
+export async function withBusy<T>(kind: string, message: string, fn: () => Promise<T>): Promise<T> {
+  if (busy.has(kind)) throw new HttpError(409, message);
+  busy.add(kind);
+  try { return await fn(); }
+  finally { busy.delete(kind); }
+}
 
 /** Full-precision floats are noise in a JSON payload and bloat SSE frames. */
 function jsonReplacer(_k: string, v: unknown) {
@@ -429,9 +514,17 @@ function findFileByRel(rel: string | null): ScannedFile | undefined {
 /** Set after Bun.serve() so the shutdown route can stop the listener. */
 let requestShutdown: (() => void) | null = null;
 
-async function readBody<T>(req: Request): Promise<T> {
-  try { return (await req.json()) as T; }
-  catch { throw new HttpError(400, "Malformed JSON body."); }
+/** True while POST /api/run sits between its live-check and job.start(). */
+let runStarting = false;
+
+/**
+ * MED-1: exported so the self-updater busy guard and the shutdown grace poll
+ * can see the in-flight run-start lock. A run accepted just before apply/settle
+ * sets this flag with no job in `running` state yet during awaited pre-flight
+ * (ensureDir/analyseSync), so it is the only signal those guards have.
+ */
+export function isRunStarting(): boolean {
+  return runStarting;
 }
 
 // --------------------------------------------------------------------------
@@ -445,8 +538,16 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     try {
       return await handleVideoApi(route.slice("video".length).replace(/^\/+/, ""), req, url, videoBridge);
     } catch (err) {
-      const status = (err as { status?: number })?.status ?? 500;
-      return json({ error: (err as Error).message }, status);
+      // INSV-4: status-carrying errors are route-intended (validation, 409s);
+      // keep their message, flattened. Anything else is internal — log the
+      // stack single-line to stderr and answer shapeless so library/spawn
+      // messages (ENOENT paths, candidate dumps) never reach the browser.
+      const known = err as { status?: number };
+      if (typeof known.status === "number") {
+        return json({ error: singleLine((err as Error).message) }, known.status);
+      }
+      console.error(singleLine(err instanceof Error ? err.stack ?? err.message : err));
+      return json({ error: "internal error" }, 500);
     }
   }
 
@@ -495,11 +596,11 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   if (route === "config" && req.method === "POST") {
     const body = await readBody<Partial<State>>(req);
 
-    // Validate against the *prospective* values before mutating anything, so a
-    // rejected change cannot leave the server half-configured.
+    // INSV-1: validate against the *prospective* values before mutating
+    // anything, so a rejected change cannot leave the server half-configured.
     const nextSource = typeof body.sourceRoot === "string" ? body.sourceRoot : state.sourceRoot;
     const nextDest = typeof body.destination === "string" ? body.destination : state.destination;
-    assertDestinationSafe(nextSource, nextDest);
+    safeDestination(nextSource, nextDest);
 
     if (typeof body.destination === "string") state.destination = body.destination;
     if (typeof body.budgetBytes === "number" && Number.isFinite(body.budgetBytes) && body.budgetBytes > 0) {
@@ -508,7 +609,8 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     if (Array.isArray(body.redundantRoots)) state.redundantRoots = body.redundantRoots;
     applyPolicyUpdate(body.policy);
 
-    // A new source invalidates everything derived from the old one.
+    // A new source invalidates everything derived from the old one,
+    // including the redundancy banner (FS-10).
     if (nextSource !== state.sourceRoot) {
       state.sourceRoot = nextSource;
       recordRecentSource(state.sourceRoot);
@@ -521,6 +623,7 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       state.lastPreview = null;
       state.lastEstimate = null;
       state.ratios = defaultRatios();
+      state.redundantRoots = [];
       resetVideoScanState();
     }
 
@@ -569,38 +672,51 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   // ---- scan ----
   if (route === "scan" && req.method === "POST") {
     const body = await readBody<{ sourceRoot?: string }>(req);
+    // INSV-1: validate the prospective source BEFORE any mutation. Assigning
+    // first let a rejected (e.g. destination-parent) path corrupt
+    // state.sourceRoot even though the request failed.
     const previousSource = state.sourceRoot;
-    if (body.sourceRoot) {
-      state.sourceRoot = body.sourceRoot;
-      assertDestinationSafe(state.sourceRoot, state.destination);
+    let nextSource = state.sourceRoot;
+    if (typeof body.sourceRoot === "string" && body.sourceRoot.trim()) {
+      nextSource = body.sourceRoot.trim();
+      safeDestination(nextSource, state.destination);
     }
-    const t0 = Date.now();
-    state.scan = await scanLibrary(state.sourceRoot);
-    // Exact-match lookups later; a linear find over 11k files per request was
-    // showing up on every compare and passthrough call.
-    state.index = new Map(state.scan.files.map((f) => [f.rel, f]));
-    state.dedupe = null;
-    state.verify = null;
-    state.dates = null;
-    state.lastEstimate = null;
-    // Measured ratios describe the current source. Keep them on a re-scan of
-    // the same folder; reset only when the source actually changed.
-    if (state.sourceRoot !== previousSource) state.ratios = defaultRatios();
-    recordRecentSource(state.sourceRoot);
-    savePersistedSettings({
-      sourceRoot: state.sourceRoot,
-      destination: state.destination,
-    });
-    return json({
-      ok: true,
-      durationMs: Date.now() - t0,
-      tree: state.scan.tree,
-      totals: state.scan.totals,
-      deadFolders: state.scan.deadFolders,
-      riskyNames: state.scan.riskyNames,
-      skipped: state.scan.skipped,
-      projects: projectList(),
-      recentSources: loadPersistedSettings().recentSources ?? [],
+    return withBusy("scan", "A library scan is already running. Wait for it to finish.", async () => {
+      state.sourceRoot = nextSource;
+      const t0 = Date.now();
+      state.scan = await scanLibrary(state.sourceRoot);
+      // Exact-match lookups later; a linear find over 11k files per request was
+      // showing up on every compare and passthrough call.
+      state.index = new Map(state.scan.files.map((f) => [f.rel, f]));
+      state.dedupe = null;
+      state.verify = null;
+      state.dates = null;
+      state.sync = null;
+      state.lastPreview = null;
+      state.lastEstimate = null;
+      // Measured ratios describe the current source. Keep them on a re-scan of
+      // the same folder; reset only when the source actually changed.
+      if (state.sourceRoot !== previousSource) {
+        state.ratios = defaultRatios();
+        state.redundantRoots = [];
+        resetVideoScanState();
+      }
+      recordRecentSource(state.sourceRoot);
+      savePersistedSettings({
+        sourceRoot: state.sourceRoot,
+        destination: state.destination,
+      });
+      return json({
+        ok: true,
+        durationMs: Date.now() - t0,
+        tree: state.scan.tree,
+        totals: state.scan.totals,
+        deadFolders: state.scan.deadFolders,
+        riskyNames: state.scan.riskyNames,
+        skipped: state.scan.skipped,
+        projects: projectList(),
+        recentSources: loadPersistedSettings().recentSources ?? [],
+      });
     });
   }
 
@@ -644,76 +760,87 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   // ---- estimate: real sample ----
   if (route === "estimate" && req.method === "POST") {
     const body = await readBody<{ sampleSize?: number; jobs?: number; policy?: Partial<Policy> }>(req);
-    applyPolicyUpdate(body.policy);
-    const preview = currentPreview();
-    const magick = requireMagick();
-    const format = state.policy.outputFormat;
-    const est = await estimateFromSample({
-      convert: preview.convert,
-      copy: preview.copy,
-      sourceRoot: state.sourceRoot,
-      magickPath: magick.path,
-      policy: state.policy,
-      jobs: Math.max(1, Math.min(body.jobs ?? 4, 16)),
-      sampleSize: Math.max(10, Math.min(body.sampleSize ?? 120, 2000)),
-      flatRatio: state.ratios[format],
-      signal: req.signal,
+    return withBusy("estimate", "An estimate is already running. Wait for it to finish.", async () => {
+      applyPolicyUpdate(body.policy);
+      const preview = currentPreview();
+      const magick = requireMagick();
+      const format = state.policy.outputFormat;
+      const est = await estimateFromSample({
+        convert: preview.convert,
+        copy: preview.copy,
+        sourceRoot: state.sourceRoot,
+        magickPath: magick.path,
+        policy: state.policy,
+        jobs: clampInt(body.jobs ?? 4, 4, 1, 16),
+        sampleSize: clampInt(body.sampleSize ?? 120, 120, 10, 2000),
+        flatRatio: state.ratios[format],
+        signal: req.signal,
+      });
+      state.lastEstimate = est;
+      // A real measurement becomes the flat ratio for this format only.
+      if (est.method === "sampled" && est.sampleSize > 0) state.ratios[format] = est.ratio;
+      return json(est);
     });
-    state.lastEstimate = est;
-    // A real measurement becomes the flat ratio for this format only.
-    if (est.method === "sampled" && est.sampleSize > 0) state.ratios[format] = est.ratio;
-    return json(est);
   }
 
   // ---- duplicates ----
   if (route === "duplicates" && req.method === "POST") {
-    if (!state.scan) throw new HttpError(400, "Scan the library first.");
     const body = await readBody<{ maxHash?: number; policy?: Partial<Policy> }>(req);
-    if (body.policy) {
-      state.policy = normalisePolicy({ ...state.policy, ...body.policy });
-    }
-    const res = await findDuplicates(state.scan.files, state.policy, {
-      maxHash: Math.min(body.maxHash ?? 6000, 40000),
-      signal: req.signal,
-    });
-    state.dedupe = res;
-    return json({
-      groups: res.groups.slice(0, 300),
-      groupCount: res.groups.length,
-      duplicateFiles: res.duplicateFiles,
-      duplicateBytes: res.duplicateBytes,
-      hashedFiles: res.hashedFiles,
-      durationMs: res.durationMs,
-      truncated: res.truncated,
-      candidateCount: res.candidateCount,
+    return withBusy("duplicates", "A duplicate scan is already running. Wait for it to finish.", async () => {
+      if (body.policy) {
+        state.policy = normalisePolicy({ ...state.policy, ...body.policy });
+      }
+      if (!state.scan) throw new HttpError(400, "Scan the library first.");
+      const res = await findDuplicates(state.scan.files, state.policy, {
+        maxHash: Math.min(body.maxHash ?? 6000, 40000),
+        signal: req.signal,
+      });
+      state.dedupe = res;
+      return json({
+        groups: res.groups.slice(0, 300),
+        groupCount: res.groups.length,
+        duplicateFiles: res.duplicateFiles,
+        duplicateBytes: res.duplicateBytes,
+        hashedFiles: res.hashedFiles,
+        durationMs: res.durationMs,
+        truncated: res.truncated,
+        candidateCount: res.candidateCount,
+        // D-2: surface real hash-error data instead of silently dropping it.
+        hashErrors: res.hashErrors,
+        unhashedGroups: res.unhashedGroups,
+      });
     });
   }
 
   // ---- metadata / dates ----
   if (route === "dates" && req.method === "POST") {
-    if (!state.scan) throw new HttpError(400, "Scan the library first.");
     const body = await readBody<{ limit?: number; policy?: Partial<Policy> }>(req);
-    if (body.policy) {
-      state.policy = normalisePolicy({ ...state.policy, ...body.policy });
-    }
-    const preview = currentPreview();
-    const magick = requireMagick();
-    const all = [...preview.convert, ...preview.copy];
-    // Say so rather than silently auditing a subset.
-    const limit = Math.max(1, Math.min(body.limit ?? 4000, 20000));
-    const subset = all.slice(0, limit);
-    const facts: ImageFacts[] = await identifyMany(
-      magick.path, subset.map((d) => d.file.abs), 8, req.signal,
-    );
-    const report = buildDateReport(facts);
-    state.dates = report;
-    return json({
-      ...report,
-      scanned: facts.length,
-      inScope: all.length,
-      truncated: all.length > subset.length,
-      omitted: all.length - subset.length,
-      undated: report.undated.slice(0, 500),
+    return withBusy("dates", "A date report is already running. Wait for it to finish.", async () => {
+      if (body.policy) {
+        state.policy = normalisePolicy({ ...state.policy, ...body.policy });
+      }
+      if (!state.scan) throw new HttpError(400, "Scan the library first.");
+      const preview = currentPreview();
+      const magick = requireMagick();
+      const all = [...preview.convert, ...preview.copy];
+      // Say so rather than silently auditing a subset.
+      const limit = Math.max(1, Math.min(body.limit ?? 4000, 20000));
+      const subset = all.slice(0, limit);
+      const facts: ImageFacts[] = await identifyMany(
+        magick.path, subset.map((d) => d.file.abs), 8, req.signal,
+      );
+      const report = buildDateReport(facts);
+      const absToRel = new Map(subset.map((d) => [d.file.abs, d.file.rel]));
+      const undatedRel = report.undated.map((p) => absToRel.get(p) ?? path.relative(state.sourceRoot, p));
+      state.dates = { ...report, undated: undatedRel };
+      return json({
+        ...report,
+        scanned: facts.length,
+        inScope: all.length,
+        truncated: all.length > subset.length,
+        omitted: all.length - subset.length,
+        undated: undatedRel.slice(0, 500),
+      });
     });
   }
 
@@ -746,7 +873,21 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     }
 
     // Let this response reach the browser, then stop the listener and exit.
-    setTimeout(() => requestShutdown?.(), 300);
+    // A job or install can slip past the checks above in the window; give a
+    // live engine a grace period to finish rather than yanking it at a fixed
+    // 300 ms, but never wait past 5 s.
+    setTimeout(() => {
+      const deadline = Date.now() + 5000;
+      const poll = () => {
+        // MED-1: include the two in-flight run-start locks. A run accepted just
+        // before shutdown has no live job yet during its awaited pre-flight;
+        // without these, the poll would call requestShutdown() and silently
+        // drop that accepted run.
+        if ((!liveJob() && !isVideoJobActive() && !isRunStarting() && !isVideoRunStarting()) || Date.now() >= deadline) requestShutdown?.();
+        else setTimeout(poll, 250);
+      };
+      poll();
+    }, 300);
     return json({ ok: true, message: "Compakta is shutting down." });
   }
 
@@ -776,10 +917,10 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   if (route === "imagemagick/install" && req.method === "POST") {
     // Replacing the binaries under running encoders is not safe on Windows.
     const live = liveJob();
-    if (live) {
+    if (live || isRunStarting()) {
       throw new HttpError(
         409,
-        live.state === "paused"
+        live?.state === "paused"
           ? "A conversion is paused. Resume or cancel it before updating ImageMagick."
           : "A conversion is running. Pause or cancel it before updating ImageMagick.",
       );
@@ -803,6 +944,9 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     return json({
       ok: true,
       ...result,
+      // S-4: explicit consumer for the producer in imagemagick.ts (also rides
+      // along in `...result`). Lets health/UI surface "integrity not verified".
+      integrityNote: result.integrityNote,
       installed: state.magick
         ? {
             version: state.magick.version,
@@ -850,7 +994,18 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
           : "A conversion is currently running. Wait for it to complete or cancel it before updating Compakta.",
       );
     }
+    // A video job or ffmpeg download would survive only half of an apply.
+    if (isVideoJobActive()) {
+      throw new HttpError(
+        409,
+        "A video conversion or FFmpeg download is active. Wait for it to finish or cancel it before updating Compakta.",
+      );
+    }
     const result = await applyAppUpdate();
+    // AU-3: applyAppUpdate() may refuse at its own re-check (a job/install
+    // started between this route's guards and the actual apply). Surface that
+    // as a clean 409 instead of a 200 with ok:false.
+    if (!result.ok) throw new HttpError(409, result.message);
     return json(result);
   }
 
@@ -878,7 +1033,13 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       );
     }
 
-    const qualities = (body.qualities ?? spec.compareQualities).slice(0, 6);
+    const rawQualities = Array.isArray(body.qualities) ? body.qualities : spec.compareQualities;
+    const cleanQualities = [...new Set(
+      rawQualities
+        .map((q) => Math.round(Number(q)))
+        .filter((q) => Number.isFinite(q) && q >= spec.quality.min && q <= spec.quality.max),
+    )].slice(0, 6);
+    const qualities = cleanQualities.length > 0 ? cleanQualities : spec.compareQualities.slice(0, 6);
     // Fixed location. This previously took a destination from the request
     // body, which let a caller direct writes anywhere on the machine.
     const outDir = previewCacheDir;
@@ -1010,7 +1171,7 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
       return new Response(Bun.file(file.abs), {
         headers: {
           "content-type": IMAGE_MIME[ext] ?? "image/jpeg",
-          "content-length": String(file.size),
+          "x-content-type-options": "nosniff",
           "cache-control": "no-store",
         },
       });
@@ -1073,7 +1234,17 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
         let ffmpeg = null;
         try { ffmpeg = findFfmpeg(); } catch { ffmpeg = null; }
         if (ffmpeg) {
-          await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, pngPath);
+          // INSv-MED: ffmpeg children must respect the same bound the magick
+          // paths honor — a gallery of video thumbs is otherwise N concurrent
+          // spawns. Double-check inside so a raced neighbor's output is kept.
+          const release = await previewSemaphore.acquire(req.signal);
+          try {
+            if (!existsSync(pngPath)) {
+              await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, pngPath);
+            }
+          } finally {
+            release();
+          }
         }
       }
       if (existsSync(pngPath)) {
@@ -1158,7 +1329,15 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
         const framePath = path.join(previewCacheDir, cacheKeyFor(file, "frame").replace(/\.jpg$/, ".png"));
         if (!existsSync(framePath)) {
           await ensureDir(previewCacheDir);
-          await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, framePath);
+          // INSv-MED: bound the ffmpeg spawn like the thumb route does.
+          const release = await previewSemaphore.acquire(req.signal);
+          try {
+            if (!existsSync(framePath)) {
+              await extractVideoFramePng(ffmpeg.ffmpegPath, file.abs, 1.0, framePath);
+            }
+          } finally {
+            release();
+          }
         }
         if (existsSync(framePath)) {
           return new Response(Bun.file(framePath), {
@@ -1222,14 +1401,22 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   // ---- run ----
   if (route === "run" && req.method === "POST") {
     const body = await readBody<{ jobs?: number; cpuLimit?: number; overwrite?: boolean; policy?: Partial<Policy>; onlyNew?: boolean }>(req);
+    // INSV-3: a mid-install run would sandwich half-swapped magick binaries
+    // between queue planning and the pool's first encode.
+    if (isInstallInProgress()) {
+      throw new HttpError(409, "ImageMagick is being installed — retry after it finishes.");
+    }
     // A paused job still owns its queue, so a fresh run must not start over it.
+    // runStarting covers the await window below (onlyNew analysis, ensureDir):
+    // two rapid requests could otherwise both pass the live check and both
+    // start encodes over the same output paths.
     const live = liveJob();
-    if (live) {
+    if (live || runStarting) {
       throw new HttpError(
         409,
-        live.state === "paused"
+        live && live.state === "paused"
           ? "A conversion is paused. Resume or cancel it before starting another."
-          : "A conversion is already running.",
+          : "A conversion is already running or starting.",
       );
     }
     if (isVideoJobActive()) {
@@ -1238,55 +1425,63 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
         "A video conversion is currently active. Pause or cancel it before starting a photo conversion.",
       );
     }
-    const magick = requireMagick();
-    const requested = mergePolicyUpdate(state.policy, body.policy);
-    const requestedSupport = magick.formats[requested.outputFormat];
-    if (!requestedSupport?.writable) {
-      throw new HttpError(
-        400,
-        `${FORMAT_SPECS[requested.outputFormat].label} cannot be encoded by this ImageMagick build ` +
-          `(format mode "${requestedSupport?.mode || "missing"}").`,
-      );
+    runStarting = true;
+    try {
+      const magick = requireMagick();
+      const requested = mergePolicyUpdate(state.policy, body.policy);
+      const requestedSupport = magick.formats[requested.outputFormat];
+      if (!requestedSupport?.writable) {
+        throw new HttpError(
+          400,
+          `${FORMAT_SPECS[requested.outputFormat].label} cannot be encoded by this ImageMagick build ` +
+            `(format mode "${requestedSupport?.mode || "missing"}").`,
+        );
+      }
+      if (body.policy) applyPolicyUpdate(body.policy);
+      const preview = currentPreview();
+      safeDestination(state.sourceRoot, state.destination);
+      await ensureDir(state.destination);
+
+      let decisions = [...preview.convert, ...preview.copy];
+
+      // "Convert new only": drop anything already converted and current.
+      if (body.onlyNew) {
+        const report = await analyseSync(decisions, state.sourceRoot, state.destination, state.policy);
+        decisions = pendingOnly(decisions, report);
+        state.sync = report;
+      }
+
+      if (decisions.length === 0) throw new HttpError(400, "Nothing to do - everything is already converted.");
+
+      const jobs = clampInt(body.jobs ?? 2, 2, 1, 32);
+      const cpuLimit = clampInt(body.cpuLimit ?? 70, 70, 10, 100);
+      const job = newJob();
+
+      void job.start({
+        decisions,
+        sourceRoot: state.sourceRoot,
+        destination: state.destination,
+        magickPath: magick.path,
+        policy: state.policy,
+        jobs,
+        cpuLimit,
+        overwrite: Boolean(body.overwrite),
+        qualityLabel: state.policy.qualities,
+      });
+
+      return json({
+        jobId: job.id,
+        total: decisions.length,
+        jobs,
+        cpuLimit,
+        outputFormat: state.policy.outputFormat,
+      });
+    } finally {
+      // job.start() flips the job to "running" synchronously (jobs.ts execute()
+      // sets state before its first await), so releasing here still leaves
+      // liveJob() populated for any request racing this return.
+      runStarting = false;
     }
-    if (body.policy) applyPolicyUpdate(body.policy);
-    const preview = currentPreview();
-    assertDestinationSafe(state.sourceRoot, state.destination);
-    await ensureDir(state.destination);
-
-    let decisions = [...preview.convert, ...preview.copy];
-
-    // "Convert new only": drop anything already converted and current.
-    if (body.onlyNew) {
-      const report = await analyseSync(decisions, state.sourceRoot, state.destination, state.policy);
-      decisions = pendingOnly(decisions, report);
-      state.sync = report;
-    }
-
-    if (decisions.length === 0) throw new HttpError(400, "Nothing to do - everything is already converted.");
-
-    const jobs = Math.max(1, Math.min(body.jobs ?? 2, 32));
-    const cpuLimit = Math.max(10, Math.min(Number(body.cpuLimit) || 70, 100));
-    const job = newJob();
-
-    void job.start({
-      decisions,
-      sourceRoot: state.sourceRoot,
-      destination: state.destination,
-      magickPath: magick.path,
-      policy: state.policy,
-      jobs,
-      cpuLimit,
-      overwrite: Boolean(body.overwrite),
-      qualityLabel: state.policy.qualities,
-    });
-
-    return json({
-      jobId: job.id,
-      total: decisions.length,
-      jobs,
-      cpuLimit,
-      outputFormat: state.policy.outputFormat,
-    });
   }
 
   // ---- SSE progress ----
@@ -1298,29 +1493,44 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     let ping: ReturnType<typeof setInterval> | null = null;
     let detach: (() => void) | null = null;
 
+    const cleanup = () => {
+      detach?.();
+      detach = null;
+      if (ping) {
+        clearInterval(ping);
+        ping = null;
+      }
+    };
+
     const stream = new ReadableStream({
       start(controller) {
         const send = (p: unknown) => {
           try {
             controller.enqueue(encoder.encode(`data: ${JSON.stringify(p, jsonReplacer)}\n\n`));
-          } catch { /* client went away */ }
+          } catch {
+            cleanup();
+          }
         };
         send({ type: "hello", jobId: job.id, state: job.state });
         if (job.lastTerminalEvent) {
           send(job.lastTerminalEvent);
+          controller.close();
+          return;
+        }
+        if (job.state === "done" || job.state === "cancelled" || job.state === "failed") {
+          controller.close();
           return;
         }
         job.on("progress", send);
         ping = setInterval(() => {
-          try { controller.enqueue(encoder.encode(": ping\n\n")); } catch { /* ignore */ }
+          try { controller.enqueue(encoder.encode(": ping\n\n")); } catch { cleanup(); }
         }, 15_000);
         // Drop the listener when the stream ends. Without this, every page
         // refresh left another listener holding a dead response.
         detach = () => { job.off("progress", send); };
       },
       cancel() {
-        detach?.();
-        if (ping) clearInterval(ping);
+        cleanup();
       },
     });
 
@@ -1359,7 +1569,7 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     if (job.state !== "paused") {
       throw new HttpError(409, `Cannot resume from "${job.state}".`);
     }
-    void job.resume();
+    void job.resume().catch((err) => console.error("[server] photo resume failed:", err));
     return json({ ok: true, state: job.state, total: job.progress().total });
   }
 
@@ -1372,57 +1582,70 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   if (route.startsWith("cancel/") && req.method === "POST") {
     const job = getJob(route.slice("cancel/".length));
     if (!job) throw new HttpError(404, "Unknown job.");
-    job.cancel();
+    // CORE: Job.cancel() is async (Promise<boolean>). Await it so a rejected
+    // persist can't surface as an unhandled rejection and the finish event
+    // cannot race this response. (The video tab uses video/jobs.ts — untouched.)
+    await job.cancel();
     return json({ ok: true, state: job.state });
   }
 
   // ---- incremental sync: what is already converted ----
   if (route === "sync" && req.method === "POST") {
-    if (!state.scan) throw new HttpError(400, "Scan the library first.");
     const body = await readBody<{ policy?: Partial<Policy> }>(req);
-    applyPolicyUpdate(body.policy);
-    const preview = currentPreview();
-    const decisions = [...preview.convert, ...preview.copy];
+    return withBusy("sync", "A sync analysis is already running. Wait for it to finish.", async () => {
+      if (!state.scan) throw new HttpError(400, "Scan the library first.");
+      applyPolicyUpdate(body.policy);
+      const preview = currentPreview();
+      const decisions = [...preview.convert, ...preview.copy];
 
-    const report = await analyseSync(
-      decisions, state.sourceRoot, state.destination, state.policy,
-    );
-    state.sync = report;
+      const report = await analyseSync(
+        decisions, state.sourceRoot, state.destination, state.policy,
+      );
+      state.sync = report;
 
-    const pending = pendingOnly(decisions, report);
+      const pending = pendingOnly(decisions, report);
 
-    return json({
-      total: report.total,
-      newCount: report.newCount,
-      changedCount: report.changedCount,
-      upToDateCount: report.upToDateCount,
-      pendingCount: report.pendingCount,
-      pendingSourceBytes: report.pendingSourceBytes,
-      orphanCount: report.orphanCount,
-      orphanBytes: report.orphanBytes,
-      orphans: report.orphans.slice(0, 25),
-      estOutputBytes: Math.round(
-        pending.filter((d) => d.verdict === "convert").reduce((a, d) => a + d.file.size, 0) *
-          currentRatio() * Math.max(1, state.policy.qualities.length) +
-        pending.filter((d) => d.verdict === "copy").reduce((a, d) => a + d.file.size, 0),
-      ),
-      outputFormat: state.policy.outputFormat,
-      durationMs: report.durationMs,
-      // A slice for the panel; the full list is thousands of rows.
-      changed: report.entries.filter((e) => e.state === "changed").slice(0, 50),
-      sampleNew: report.entries.filter((e) => e.state === "new").slice(0, 25),
+      return json({
+        total: report.total,
+        newCount: report.newCount,
+        changedCount: report.changedCount,
+        upToDateCount: report.upToDateCount,
+        pendingCount: report.pendingCount,
+        pendingSourceBytes: report.pendingSourceBytes,
+        orphanCount: report.orphanCount,
+        orphanBytes: report.orphanBytes,
+        orphans: report.orphans.slice(0, 25),
+        estOutputBytes: Math.round(
+          pending.filter((d) => d.verdict === "convert").reduce((a, d) => a + d.file.size, 0) *
+            currentRatio() * Math.max(1, state.policy.qualities.length) +
+          pending.filter((d) => d.verdict === "copy").reduce((a, d) => a + d.file.size, 0),
+        ),
+        outputFormat: state.policy.outputFormat,
+        durationMs: report.durationMs,
+        // A slice for the panel; the full list is thousands of rows.
+        changed: report.entries.filter((e) => e.state === "changed").slice(0, 50),
+        sampleNew: report.entries.filter((e) => e.state === "new").slice(0, 25),
+      });
     });
   }
 
   // ---- opt-in orphan cleanup ----
   if (route === "sync/clean-orphans" && req.method === "POST") {
-    if (!state.scan) throw new HttpError(400, "Scan the library first.");
-    const preview = currentPreview();
-    const decisions = [...preview.convert, ...preview.copy];
-    const report = await analyseSync(decisions, state.sourceRoot, state.destination, state.policy);
-    const result = await cleanOrphans(state.destination, report.allOrphans);
-    state.sync = null;
-    return json(result);
+    const body = await readBody<{ confirm?: boolean }>(req);
+    // This route deletes files in the destination. A stray double-click or a
+    // misfired automation must not sweep orphans: require the explicit flag.
+    if (body.confirm !== true) {
+      throw new HttpError(409, "Pass { confirm: true } to delete orphaned outputs.");
+    }
+    return withBusy("clean-orphans", "An orphan cleanup is already running. Wait for it to finish.", async () => {
+      if (!state.scan) throw new HttpError(400, "Scan the library first.");
+      const preview = currentPreview();
+      const decisions = [...preview.convert, ...preview.copy];
+      const report = await analyseSync(decisions, state.sourceRoot, state.destination, state.policy);
+      const result = await cleanOrphans(state.destination, report.allOrphans);
+      state.sync = null;
+      return json(result);
+    });
   }
 
   // ---- verify the outputs of a finished run ----
@@ -1430,9 +1653,9 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const body = await readBody<{ jobId?: string; limit?: number }>(req);
     const job = body.jobId ? getJob(body.jobId) : undefined;
     if (!job) throw new HttpError(400, "Pass jobId of a finished run.");
-    // A running job has files mid-encode, and a paused-then-resumed one holds
-    // only the results of its first segment. Either way the report is wrong:
-    // in-flight outputs look empty and are reported as failures.
+    // Results accumulate across resume (jobs.ts appends each segment's
+    // results), but a running or paused job still has files mid-encode:
+    // in-flight outputs look empty and would be reported as failures.
     if (job.state === "running" || job.state === "paused") {
       throw new HttpError(
         409,
@@ -1471,6 +1694,9 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
   }
 
   if (route === "undo" && req.method === "POST") {
+    if (liveJob() || isRunStarting()) {
+      throw new HttpError(409, "Cannot undo while a conversion is running or paused.");
+    }
     const body = await readBody<{ id: string; dryRun?: boolean }>(req);
     const list = await manifestsFor(state.destination);
     const manifest = list.find((m) => m.id === body.id);
@@ -1484,7 +1710,21 @@ async function handleApi(pathname: string, req: Request, url: URL): Promise<Resp
     const body = await readBody<{ destination?: string }>(req);
     const target = body.destination || state.destination;
     if (!target) throw new HttpError(400, "Destination is not set.");
-    if (!existsSync(target)) {
+    // INSv-MED: only folders inside the configured destination may be opened.
+    // A client-supplied arbitrary path must not become an explorer-open
+    // primitive for any directory on the machine.
+    // LOW-2: check containment BEFORE existence. Otherwise an outside path
+    // yields 404 (exists) vs 400 (missing), an existence oracle for arbitrary
+    // directories even though the response never opens them.
+    const resolved = pathKey(path.resolve(target));
+    const destPrefix = pathKey(path.resolve(state.destination));
+    if (resolved !== destPrefix) {
+      const prefix = destPrefix.endsWith(path.sep) ? destPrefix : destPrefix + path.sep;
+      if (!resolved.startsWith(prefix)) {
+        throw new HttpError(400, "Requested folder is outside the configured destination.");
+      }
+    }
+    if (!(await dirExists(target))) {
       throw new HttpError(404, `Destination directory does not exist on disk: ${target}`);
     }
     const ok = openPathInOs(target);
@@ -1517,10 +1757,11 @@ function hashRel(rel: string): string {
 
 /** PowerShell FolderBrowserDialog - gives a real native picker with no extra deps. */
 function powershellFolderPicker(title: string): Promise<string | null> {
+  const safeTitle = String(title ?? "Choose a folder").replace(/[\r\n\0]/g, " ").slice(0, 120);
   const ps = `
 Add-Type -AssemblyName System.Windows.Forms
 $d = New-Object System.Windows.Forms.FolderBrowserDialog
-$d.Description = '${title.replace(/'/g, "''")}'
+$d.Description = $env:COMPAKTA_PICK_TITLE
 $d.ShowNewFolderButton = $true
 if ($d.ShowDialog() -eq 'OK') { Write-Output $d.SelectedPath }
 $d.Dispose()
@@ -1528,6 +1769,8 @@ $d.Dispose()
   return new Promise((resolve) => {
     const c = spawn("powershell.exe", ["-NoProfile", "-STA", "-Command", ps], {
       windowsHide: true,
+      stdio: ["ignore", "pipe", "ignore"],
+      env: { ...process.env, COMPAKTA_PICK_TITLE: safeTitle },
     });
     let out = "";
     c.stdout.on("data", (d) => { out += String(d); });
@@ -1690,7 +1933,42 @@ export function startServer(options: ServerOptions = {}): RunningServer {
   if (options.publicDir) publicDir = path.resolve(options.publicDir);
   if (options.previewCacheDir) previewCacheDir = path.resolve(options.previewCacheDir);
 
-  const PORT = options.port ?? Number(process.env.PORT ?? 5178);
+  // AU-3: the self-updater must never exit() while work is live. Inject one
+  // busy-guard source of truth covering every signal:
+  //   - photo job          -> liveJob()
+  //   - photo run starting -> isRunStarting() (run accepted, pre-flight await)
+  //   - video job          -> isVideoJobActive() (video/routes.ts:101-103)
+  //   - video run starting -> isVideoRunStarting() (run accepted, pre-flight await)
+  //   - FFmpeg install     -> isVideoJobActive() already includes
+  //                           getFfmpegInstallProgress().running (no new helper needed)
+  //   - ImageMagick install-> isInstallInProgress() (imagemagick.ts:127)
+  // MED-1: the two *Starting flags close the gap where a run is accepted but
+  // no job is "running" yet. Without them the 1 s exit timer at app-update.ts
+  // reports idle and process.exit(0) silently drops the accepted run.
+  setApplyBusyGuard(() => {
+    const photo = liveJob();
+    if (photo) return `a photo conversion is ${photo.state}`;
+    if (isRunStarting()) return "a photo conversion is starting";
+    if (isVideoJobActive()) return "a video conversion or FFmpeg install is active";
+    if (isVideoRunStarting()) return "a video conversion is starting";
+    if (isInstallInProgress()) return "an ImageMagick install is in progress";
+    return null;
+  });
+
+  // FS-09: a non-numeric or out-of-range PORT (shell typos, stale exports)
+  // must not crash the boot; warn and fall back to the default.
+  const DEFAULT_PORT = 5178;
+  const RAW_PORT = process.env.PORT?.trim();
+  const envPort = (() => {
+    if (RAW_PORT === undefined || RAW_PORT === "") return DEFAULT_PORT;
+    const n = Number(RAW_PORT);
+    if (!Number.isInteger(n) || n < 1 || n > 65535) {
+      console.warn(`Ignoring invalid PORT="${RAW_PORT}"; using ${DEFAULT_PORT}.`);
+      return DEFAULT_PORT;
+    }
+    return n;
+  })();
+  const PORT = options.port ?? envPort;
 
   const server = Bun.serve({
     port: PORT,
@@ -1710,6 +1988,26 @@ export function startServer(options: ServerOptions = {}): RunningServer {
         return new Response("Forbidden origin", { status: 403 });
       }
       const url = new URL(req.url);
+      // FS-02/INSV-guard: fetch metadata pins API access to same-tab usage.
+      // Cross-site GETs (e.g. a planted <img src="/api/...">) are blocked —
+      // they leak scanned-file existence via 200/404/415 and can trigger
+      // magick/ffmpeg child spawns. Static + /preview-cache stay open so the
+      // compare panel's <img> elements keep working, and same-origin GETs
+      // (page fetches, SSE) are unaffected.
+      if (url.pathname.startsWith("/api/")) {
+        const site = req.headers.get("sec-fetch-site");
+        if (site && site !== "same-origin" && site !== "same-site" && site !== "none") {
+          return new Response("Forbidden cross-site request", { status: 403 });
+        }
+        // Wave-1 matrix: POST bodies are application/json only (the bundled
+        // client always sets the header); text/plain or form posts are abuse.
+        if (req.method === "POST") {
+          const ct = req.headers.get("content-type") ?? "";
+          if (ct && !/^application\/([a-z0-9.+-]+\+)?json\b/i.test(ct)) {
+            return new Response("Unsupported Media Type", { status: 415 });
+          }
+        }
+      }
       try {
         if (url.pathname.startsWith("/api/")) {
           return await handleApi(url.pathname, req, url);
@@ -1717,8 +2015,11 @@ export function startServer(options: ServerOptions = {}): RunningServer {
         return await serveStatic(url.pathname);
       } catch (err) {
         if (err instanceof HttpError) return json({ error: err.message }, err.status);
-        console.error(err);
-        return json({ error: (err as Error).message ?? "internal error" }, 500);
+        // INSV-1/FS-04: internal failures must not shape the response. Detail
+        // goes to stderr single-line (messages embed user paths); the browser
+        // gets a shapeless body.
+        console.error(singleLine(err instanceof Error ? err.stack ?? err.message : err));
+        return json({ error: "internal error" }, 500);
       }
     },
   });
